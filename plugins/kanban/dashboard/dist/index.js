@@ -466,17 +466,73 @@
   // standard `drop` event and our `hermes-kanban:drop` event.
   // -------------------------------------------------------------------------
 
-  function attachTouchDrag(el, taskId) {
+  function attachTouchDrag(el, taskId, currentStatus) {
     if (!el) return;
-    function onDown(e) {
-      if (e.pointerType !== "touch") return;
+    let cleanupGesture = null;
+    let dragActive = false;
+    let suppressClickUntil = 0;
+
+    function onClickCapture(e) {
+      if (!dragActive && Date.now() >= suppressClickUntil) return;
       e.preventDefault();
-      const proxy = el.cloneNode(true);
-      proxy.classList.add("hermes-kanban-touch-proxy");
-      document.body.appendChild(proxy);
+      e.stopPropagation();
+    }
+
+    function onContextMenu(e) {
+      if (dragActive) e.preventDefault();
+    }
+
+    function onDown(e) {
+      if (e.pointerType !== "touch" || e.isPrimary === false) return;
+      if (cleanupGesture) cleanupGesture();
+
+      const pointerId = e.pointerId;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let proxy = null;
       let lastTarget = null;
+      let dragging = false;
+      let holdTimer = setTimeout(startDrag, 350);
+
+      function startDrag() {
+        holdTimer = null;
+        dragging = true;
+        dragActive = true;
+        suppressClickUntil = Date.now() + 500;
+        proxy = el.cloneNode(true);
+        proxy.classList.add("hermes-kanban-touch-proxy");
+        document.body.appendChild(proxy);
+        proxy.style.position = "fixed";
+        proxy.style.pointerEvents = "none";
+        proxy.style.opacity = "0.85";
+        proxy.style.zIndex = "9999";
+        proxy.style.width = `${el.offsetWidth}px`;
+        proxy.style.left = `${startX - el.offsetWidth / 2}px`;
+        proxy.style.top = `${startY - 24}px`;
+        if (el.setPointerCapture) {
+          try { el.setPointerCapture(pointerId); } catch (_e) { /* noop */ }
+        }
+      }
+
+      function cleanup() {
+        if (holdTimer !== null) clearTimeout(holdTimer);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", cancel);
+        if (lastTarget) lastTarget.classList.remove("hermes-kanban-column--drop");
+        if (proxy && proxy.parentNode) proxy.remove();
+        dragActive = false;
+        if (cleanupGesture === cleanup) cleanupGesture = null;
+      }
 
       function move(ev) {
+        if (ev.pointerId !== pointerId) return;
+        if (!dragging) {
+          const distance = Math.hypot(ev.clientX - startX, ev.clientY - startY);
+          if (distance > 8) cleanup();
+          return;
+        }
+        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -491,12 +547,16 @@
           lastTarget = target;
         }
       }
-      function up() {
-        document.removeEventListener("pointermove", move);
-        document.removeEventListener("pointerup", up);
-        document.removeEventListener("pointercancel", up);
+
+      function up(ev) {
+        if (ev.pointerId !== pointerId) return;
+        if (!dragging) {
+          cleanup();
+          return;
+        }
+        ev.preventDefault();
+        suppressClickUntil = Date.now() + 500;
         if (lastTarget) {
-          lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
           const isTrash = lastTarget.hasAttribute("data-kanban-trash");
           if (isTrash) {
@@ -504,29 +564,36 @@
               detail: { taskId },
               bubbles: true,
             }));
-          } else if (status) {
+          } else if (status && status !== currentStatus) {
             lastTarget.dispatchEvent(new CustomEvent("hermes-kanban:drop", {
               detail: { taskId, status },
               bubbles: true,
             }));
           }
         }
-        proxy.remove();
+        cleanup();
       }
-      // Kick off proxy at the pointer origin.
-      proxy.style.position = "fixed";
-      proxy.style.pointerEvents = "none";
-      proxy.style.opacity = "0.85";
-      proxy.style.zIndex = "9999";
-      proxy.style.width = `${el.offsetWidth}px`;
-      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
-      proxy.style.top = `${e.clientY - 24}px`;
+
+      function cancel(ev) {
+        if (ev.pointerId !== pointerId) return;
+        if (dragging) suppressClickUntil = Date.now() + 500;
+        cleanup();
+      }
+
+      cleanupGesture = cleanup;
       document.addEventListener("pointermove", move);
       document.addEventListener("pointerup", up);
-      document.addEventListener("pointercancel", up);
+      document.addEventListener("pointercancel", cancel);
     }
     el.addEventListener("pointerdown", onDown);
-    return function () { el.removeEventListener("pointerdown", onDown); };
+    el.addEventListener("click", onClickCapture, true);
+    el.addEventListener("contextmenu", onContextMenu);
+    return function () {
+      if (cleanupGesture) cleanupGesture();
+      el.removeEventListener("pointerdown", onDown);
+      el.removeEventListener("click", onClickCapture, true);
+      el.removeEventListener("contextmenu", onContextMenu);
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -2998,8 +3065,8 @@
     const cardRef = useRef(null);
 
     useEffect(function () {
-      return attachTouchDrag(cardRef.current, t.id);
-    }, [t.id]);
+      return attachTouchDrag(cardRef.current, t.id, t.status);
+    }, [t.id, t.status]);
 
     const handleDragStart = function (e) {
       e.dataTransfer.setData(MIME_TASK, t.id);
