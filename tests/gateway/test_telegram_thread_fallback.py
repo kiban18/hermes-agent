@@ -137,6 +137,38 @@ def _make_adapter():
     return adapter
 
 
+def test_telegram_peer_report_response_is_not_replied_to_bot() -> None:
+    event = MessageEvent(
+        text="[내부 보고 · peer_123456789abc] 연결 확인",
+        message_type=MessageType.TEXT,
+        message_id="42",
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            thread_id=None,
+            is_bot=True,
+        ),
+    )
+
+    assert _reply_anchor_for_event(event) is None
+
+
+def test_telegram_peer_request_response_still_replies_to_requesting_bot() -> None:
+    event = MessageEvent(
+        text="[내부 요청 · peer_123456789abc] 연결 확인",
+        message_type=MessageType.TEXT,
+        message_id="42",
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            thread_id=None,
+            is_bot=True,
+        ),
+    )
+
+    assert _reply_anchor_for_event(event) == "42"
+
+
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
     """Reply-derived thread ids in ordinary groups must not create topic lanes."""
     import plugins.platforms.telegram.adapter as telegram_mod
@@ -722,5 +754,4 @@ async def test_thread_fallback_only_fires_once():
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
-
 

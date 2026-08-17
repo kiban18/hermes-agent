@@ -146,6 +146,16 @@ def _reply_anchor_for_event(event) -> str | None:
     thread_id = getattr(source, "thread_id", None)
     raw_message = getattr(event, "raw_message", None)
     if (
+        platform == "telegram"
+        and getattr(source, "is_bot", False)
+        and getattr(source, "chat_type", None) in {"group", "forum", "supergroup"}
+        and re.match(r"^\s*\[내부 보고\s*·\s*peer_[A-Za-z0-9]+\]", getattr(event, "text", "") or "")
+    ):
+        # The worker must reply to the manager's request so the manager wakes.
+        # The manager's summary must be top-level; replying to the worker would
+        # wake it again and create an unbounded bot-to-bot reply chain.
+        return None
+    if (
         platform == "slack"
         and isinstance(raw_message, dict)
         and raw_message.get("_hermes_no_thread_response")
