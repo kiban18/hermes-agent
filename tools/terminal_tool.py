@@ -52,6 +52,80 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+_REMOTE_WORKER_SCHEDULER = None
+_REMOTE_WORKER_HEAVY = re.compile(
+    r"\b(?:pytest|playwright|cypress|ruff|mypy|pyright|eslint|tsc|gradle|"
+    r"gradlew|flutter|cargo|docker\s+(?:compose\s+)?build)\b"
+    r"|\b(?:npm|pnpm|yarn|bun|go|make|mvn|mvnw)\b[^;&|]*"
+    r"\b(?:test|vitest|jest|build|check|lint|verify|package)\b",
+    re.IGNORECASE,
+)
+_REMOTE_WORKER_CREDENTIAL_NAME = re.compile(
+    r"(?:pass(?:word)?|pwd|secret|token|api[_-]?key|credential|auth)",
+    re.IGNORECASE,
+)
+_REMOTE_WORKER_URL_CREDENTIAL = re.compile(r"://[^/@\s]+:[^/@\s]+@")
+
+
+class RemoteWorkerPolicyError(RuntimeError):
+    """A mandatory remote verification policy could not be evaluated."""
+
+
+def _contains_inline_credentials(command: str) -> bool:
+    if _REMOTE_WORKER_URL_CREDENTIAL.search(command):
+        return True
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True
+    for token in tokens:
+        if "=" in token:
+            name, value = token.split("=", 1)
+            if value and _REMOTE_WORKER_CREDENTIAL_NAME.search(name):
+                return True
+        elif token.startswith("-") and _REMOTE_WORKER_CREDENTIAL_NAME.search(token):
+            return True
+    return False
+
+
+def _load_remote_worker_scheduler():
+    global _REMOTE_WORKER_SCHEDULER
+    if _REMOTE_WORKER_SCHEDULER is None:
+        path = Path.home() / ".claude/skills/remote-worker/scripts/active_scheduler.py"
+        spec = importlib.util.spec_from_file_location("_hermes_remote_worker_scheduler", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load remote-worker scheduler: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _REMOTE_WORKER_SCHEDULER = module
+    return _REMOTE_WORKER_SCHEDULER
+
+
+def _apply_remote_worker_policy(command: str, cwd: str, env_type: str) -> str:
+    """Route known long local verification through the shared scheduler."""
+    if env_type != "local" or _contains_inline_credentials(command):
+        return command
+    is_heavy = bool(_REMOTE_WORKER_HEAVY.search(command))
+    try:
+        payload = {
+            "tool_name": "Bash",
+            "cwd": cwd,
+            "tool_input": {"command": command},
+        }
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            payload["remote_worker_policy"] = "kanban"
+        result = _load_remote_worker_scheduler().decision(payload)
+        if result:
+            return result["hookSpecificOutput"]["updatedInput"]["command"]
+    except Exception as exc:
+        logger.warning("remote-worker policy hook failed: %s", exc)
+        if is_heavy:
+            raise RemoteWorkerPolicyError(
+                "Blocked: remote-worker policy could not route this long "
+                "verification command. Restore the scheduler or run it "
+                "through remote-worker explicitly."
+            ) from exc
+    return command
 
 
 def _redact_terminal_error_text(value: Any) -> str:
@@ -2998,6 +3072,22 @@ def terminal_tool(
                     "error": _self_repo_msg,
                     "status": "blocked",
                 }, ensure_ascii=False)
+
+        policy_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=getattr(env, "cwd", None) or cwd,
+            session_key=session_key,
+            env_type=env_type,
+        )
+        try:
+            command = _apply_remote_worker_policy(command, policy_cwd, env_type)
+        except RemoteWorkerPolicyError as exc:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": str(exc),
+                "status": "blocked",
+            }, ensure_ascii=False)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)

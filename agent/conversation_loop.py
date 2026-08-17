@@ -1031,6 +1031,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
+    tool_names = getattr(agent, "valid_tool_names", None)
+    if isinstance(tool_names, (list, set, tuple)) and "terminal" in tool_names:
+        required_policy_markers = (
+            "# Remote worker execution policy",
+            "# Organization Kanban reporting scope",
+        )
+        if any(marker not in prompt for marker in required_policy_markers):
+            return False
+
     def line_value(label: str) -> str:
         """Last matching line wins.
 

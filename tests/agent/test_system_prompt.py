@@ -72,6 +72,14 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_remote_worker_policy_is_injected_for_terminal_agents():
+    prompt = _stable_prompt(_make_agent(valid_tool_names=["terminal"]))
+    assert "Seoyoon MacBook Air" in prompt
+    assert "never open the E2E browser on this MacBook Pro" in prompt
+    assert "list --mine" in prompt
+    assert "Managers must not replace subordinate reports" in prompt
+
+
 def test_representative_action_guidance_is_injected_for_every_profile():
     prompt = _stable_prompt(_make_agent(valid_tool_names=[]))
     assert prompt.count("# Representative action cards") == 1
@@ -337,13 +345,15 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join((
-        "IDENTITY",
-        "HELP",
-        system_prompt.REPRESENTATIVE_ACTION_GUIDANCE,
-        "STEER",
-        "CODING_STABLE",
-    ))
+    assert agent._cached_system_prompt_static == "\n\n".join(
+        (
+            "IDENTITY",
+            "HELP",
+            system_prompt.REPRESENTATIVE_ACTION_GUIDANCE,
+            "STEER",
+            "CODING_STABLE",
+        )
+    )
 
 
 class TestTelegramRichMessagesHint:

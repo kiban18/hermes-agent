@@ -72,6 +72,19 @@ class TestStoredPromptReuse:
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
 
+    def test_terminal_session_rebuilds_when_organization_policy_is_missing(self):
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": "old terminal prompt"}
+        agent = _make_agent(session_db=db, prebuilt_prompt="new policy prompt")
+        agent.valid_tool_names = ["terminal"]
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert agent._cached_system_prompt == "new policy prompt"
+        agent._build_system_prompt.assert_called_once_with(None)
+
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.
 
