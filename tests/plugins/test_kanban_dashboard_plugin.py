@@ -66,7 +66,11 @@ def client(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def test_board_empty(client):
+def test_board_empty(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "researcher"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: test\n", encoding="utf-8")
+
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
@@ -79,7 +83,7 @@ def test_board_empty(client):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
-    assert data["assignees"] == []
+    assert data["assignees"] == ["default", "researcher"]
     assert data["latest_event_id"] == 0
 
 
@@ -115,7 +119,7 @@ def test_create_task_appears_on_board(client):
     assert len(ready["tasks"]) == 1
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
-    assert "researcher" in data["assignees"]
+    assert "researcher" not in data["assignees"]
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -207,6 +211,92 @@ def test_tenant_filter(client):
     r = client.get("/api/plugins/kanban/board?tenant=t2")
     total = sum(len(c["tasks"]) for c in r.json()["columns"])
     assert total == 1
+
+
+def test_board_sorts_by_latest_status_change_not_latest_activity(client, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 100)
+    high_priority = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "high priority", "priority": 9},
+    ).json()["task"]
+    monkeypatch.setattr(time, "time", lambda: 200)
+    recently_changed = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "recently changed", "priority": 1},
+    ).json()["task"]
+
+    monkeypatch.setattr(time, "time", lambda: 300)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{high_priority['id']}",
+        json={"status": "blocked", "block_reason": "wait"},
+    ).status_code == 200
+    monkeypatch.setattr(time, "time", lambda: 400)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{recently_changed['id']}",
+        json={"status": "blocked", "block_reason": "wait"},
+    ).status_code == 200
+
+    priority_board = client.get("/api/plugins/kanban/board").json()
+    priority_ids = next(
+        c["tasks"] for c in priority_board["columns"] if c["name"] == "blocked"
+    )
+    assert [task["id"] for task in priority_ids] == [
+        high_priority["id"], recently_changed["id"],
+    ]
+
+    recent_board = client.get(
+        "/api/plugins/kanban/board?sort=status_changed"
+    ).json()
+    recent_ids = next(
+        c["tasks"] for c in recent_board["columns"] if c["name"] == "blocked"
+    )
+    assert [task["id"] for task in recent_ids] == [
+        recently_changed["id"], high_priority["id"],
+    ]
+
+    monkeypatch.setattr(time, "time", lambda: 500)
+    assert client.post(
+        f"/api/plugins/kanban/tasks/{high_priority['id']}/comments",
+        json={"body": "new comment"},
+    ).status_code == 200
+    recent_board = client.get(
+        "/api/plugins/kanban/board?sort=status_changed"
+    ).json()
+    recent_ids = next(
+        c["tasks"] for c in recent_board["columns"] if c["name"] == "blocked"
+    )
+    assert [task["id"] for task in recent_ids] == [
+        recently_changed["id"], high_priority["id"],
+    ]
+
+    invalid = client.get("/api/plugins/kanban/board?sort=unknown")
+    assert invalid.status_code == 400
+
+    monkeypatch.setattr(time, "time", lambda: 600)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{high_priority['id']}",
+        json={"status": "done"},
+    ).status_code == 200
+    monkeypatch.setattr(time, "time", lambda: 700)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{recently_changed['id']}",
+        json={"status": "done"},
+    ).status_code == 200
+    with kb.connect() as conn:
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id IN (?, ?)",
+            (high_priority["id"], recently_changed["id"]),
+        )
+
+    recent_board = client.get(
+        "/api/plugins/kanban/board?sort=status_changed"
+    ).json()
+    recent_ids = next(
+        c["tasks"] for c in recent_board["columns"] if c["name"] == "done"
+    )
+    assert [task["id"] for task in recent_ids] == [
+        recently_changed["id"], high_priority["id"],
+    ]
 
 
 def test_dashboard_markdown_html_is_sanitized_before_render():
@@ -487,6 +577,44 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert run.outcome == "reclaimed"
         next_review = kb.claim_review_task(conn, task_id)
         assert next_review is not None
+
+
+def test_dashboard_cannot_grant_representative_approval(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="representative approval",
+            body="승인 주체: 대표",
+            assignee="default",
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done"},
+    )
+
+    assert response.status_code == 409
+    assert f"/kanban approve {task_id}" in response.json()["detail"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_dashboard_cannot_grant_another_profiles_approval(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="manager approval",
+            body="승인 주체: project-manager",
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done"},
+    )
+
+    assert response.status_code == 409
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
 # ---------------------------------------------------------------------------
