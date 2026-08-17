@@ -251,7 +251,7 @@ REPRESENTATIVE_ACTION_GUIDANCE = (
     "the assigned profile verifies it, records the verification on the card, "
     "and completes the card when its acceptance criteria are met. Unblock only "
     "when automated follow-up work must resume. In status reports, list these "
-    "cards separately under `대표 실행 대기` with the card id, requested human "
+    "cards separately under `👤 Human` with the card id, requested human "
     "action, result owner, and missing completion evidence."
 )
 

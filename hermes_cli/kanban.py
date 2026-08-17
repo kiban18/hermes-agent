@@ -53,7 +53,7 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    representative = " [대표 실행 대기]" if kb.representative_action_required(t) else ""
+    representative = " [👤 Human]" if kb.representative_action_required(t) else ""
     return (
         f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  "
         f"{t.title}{representative}"
@@ -1835,7 +1835,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
     if kb.representative_action_required(task):
-        print("  human:     representative action pending")
+        print("  lane:      👤 Human")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +

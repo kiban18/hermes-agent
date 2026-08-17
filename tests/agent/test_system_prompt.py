@@ -78,7 +78,7 @@ def test_representative_action_guidance_is_injected_for_every_profile():
     assert "사람 실행자: 대표" in prompt
     assert "keep the assigned profile as the result owner" in prompt
     assert "do not use `/kanban approve`" in prompt
-    assert "`대표 실행 대기`" in prompt
+    assert "separately under `👤 Human`" in prompt
 
 
 def _prompt_parts(agent):

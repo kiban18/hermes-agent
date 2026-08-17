@@ -810,6 +810,7 @@ export interface Translations {
       scheduled: string;
       ready: string;
       running: string;
+      representative_action: string;
       blocked: string;
       done: string;
       archived: string;
@@ -820,6 +821,7 @@ export interface Translations {
       scheduled: string;
       ready: string;
       running: string;
+      representative_action: string;
       blocked: string;
       done: string;
       archived: string;
