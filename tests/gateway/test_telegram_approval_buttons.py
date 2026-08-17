@@ -94,7 +94,7 @@ class TestTelegramExecApproval:
             allow_permanent=False,
         )
 
-        assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
+        assert buttons == ["✅ 이번만 허용", "✅ 이 대화에서 허용", "❌ 거부"]
 
     @pytest.mark.asyncio
     async def test_full_approval_keyboard_is_two_by_two(self, monkeypatch):
@@ -116,8 +116,8 @@ class TestTelegramExecApproval:
         )
 
         assert captured_rows == [
-            ["✅ Allow Once", "✅ Session"],
-            ["✅ Always", "❌ Deny"],
+            ["✅ 이번만 허용", "✅ 이 대화에서 허용"],
+            ["✅ 항상 허용", "❌ 거부"],
         ]
 
 
@@ -142,7 +142,7 @@ class TestTelegramExecApproval:
         )
 
         assert captured_rows == [
-            ["✅ Allow Once", "❌ Deny"],
+            ["✅ 이번만 허용", "❌ 거부"],
         ]
 
 
@@ -329,4 +329,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

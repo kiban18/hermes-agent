@@ -6203,10 +6203,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
     # Template attrs for the shared _format_exec_approval core (HTML mode).
-    _EA_HEADER = "⚠️ <b>Command Approval Required</b>\n\n"
+    _EA_HEADER = "⚠️ <b>명령 실행 승인이 필요합니다</b>\n\n"
     _EA_CODE_OPEN = "<pre>"
     _EA_CODE_CLOSE = "</pre>\n\n"
-    _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
+    _EA_REASON_LABEL = "승인이 필요한 이유: "
+    _EA_SMART_DENY_LINE = "\n\n<b>자동 거부:</b> 관리자 예외 승인은 이번 작업에만 적용됩니다."
     _EA_CMD_BUDGET = 3800
 
     def _ea_escape(self, text: str) -> str:
@@ -6243,17 +6244,17 @@ class TelegramAdapter(BasePlatformAdapter):
             approval_id = next(self._approval_counter)
 
             buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
+                InlineKeyboardButton("✅ 이번만 허용", callback_data=f"ea:once:{approval_id}")
             ]
             if not smart_denied and allow_session:
                 buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
+                    InlineKeyboardButton("✅ 이 대화에서 허용", callback_data=f"ea:session:{approval_id}")
                 )
                 if allow_permanent:
                     buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                        InlineKeyboardButton("✅ 항상 허용", callback_data=f"ea:always:{approval_id}")
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
+            buttons.append(InlineKeyboardButton("❌ 거부", callback_data=f"ea:deny:{approval_id}"))
             # Pair into rows (2x2 for the full set) so labels stay readable on
             # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
             rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
