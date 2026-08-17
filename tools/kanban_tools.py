@@ -601,6 +601,10 @@ def _handle_list(args: dict, **kw) -> str:
     if guard:
         return guard
     assignee = args.get("assignee")
+    if not assignee:
+        from hermes_cli.profiles import get_active_profile_name
+
+        assignee = get_active_profile_name() or "default"
     status = args.get("status")
     tenant = args.get("tenant")
     include_archived, bool_error = _parse_bool_arg(args, "include_archived")
@@ -783,8 +787,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
-            except kb.ApprovalOwnerRequiredError as owner_err:
-                return tool_error(str(owner_err))
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -871,11 +873,25 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            expected_run_id = _worker_run_id(tid)
+            can_block = bool(
+                task
+                and task.status in {"running", "ready"}
+                and (
+                    expected_run_id is None
+                    or task.current_run_id == expected_run_id
+                )
+            )
+            subscribed = (
+                _ensure_needs_input_subscription(conn, tid)
+                if kind == "needs_input" and can_block
+                else False
+            )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
             )
             if not ok:
                 return tool_error(
@@ -891,6 +907,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                subscribed=subscribed,
             )
         finally:
             conn.close()
@@ -1597,6 +1614,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+        task = _kb.get_task(conn, task_id)
+        if task and task.assignee:
+            for existing in _kb.list_notify_subs(conn, task_id):
+                if (
+                    existing.get("platform") == platform
+                    and existing.get("chat_id") == chat_id
+                    and (existing.get("thread_id") or "") == (thread_id or "")
+                    and existing.get("notifier_profile") == task.assignee
+                ):
+                    return True
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
@@ -1611,6 +1638,44 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
+        )
+        return False
+
+
+def _ensure_needs_input_subscription(conn: Any, task_id: str) -> bool:
+    """Subscribe a human-visible route before emitting a needs_input block."""
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        if _kb.list_notify_subs(conn, task_id):
+            return True
+        if _maybe_auto_subscribe(conn, task_id):
+            return True
+
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        notifier_profile = os.environ.get("HERMES_PROFILE") or "default"
+        subscribed = False
+        for platform in config.get_connected_platforms():
+            home = config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=platform.value,
+                chat_id=home.chat_id,
+                thread_id=home.thread_id,
+                user_id=home.user_id,
+                notifier_profile=notifier_profile,
+                delivery_mode="notify+wake",
+            )
+            subscribed = True
+        return subscribed
+    except Exception as exc:
+        logger.warning(
+            "needs_input auto-subscribe failed for %s: %r", task_id, exc
         )
         return False
 
@@ -1725,12 +1790,13 @@ KANBAN_SHOW_SCHEMA = {
 KANBAN_LIST_SCHEMA = {
     "name": "kanban_list",
     "description": (
-        "List Kanban task summaries so an orchestrator profile can discover "
-        "work to route. Supports the same core filters as the CLI: assignee, "
+        "List Kanban task summaries for the active profile by default. "
+        "An explicit assignee filter is reserved for deliberate routing work. "
+        "Supports the same core filters as the CLI: assignee, "
         "status, tenant, include_archived, and limit. Returns compact rows "
         "with ids, title, status, assignee, representative-action flag, "
-        "priority, parent/child ids, and "
-        "counts. Bounded to 50 rows by default, 200 max, with truncation "
+        "priority, parent/child ids, and counts. Bounded to 50 rows by "
+        "default, 200 max, with truncation "
         "metadata. Also recomputes ready tasks before listing, matching the "
         "CLI. Orchestrator-only — dispatcher-spawned task workers never see "
         "this tool."
@@ -1740,7 +1806,7 @@ KANBAN_LIST_SCHEMA = {
         "properties": {
             "assignee": {
                 "type": "string",
-                "description": "Optional assignee/profile filter.",
+                "description": "Optional assignee/profile filter. Defaults to the active profile.",
             },
             "status": {
                 "type": "string",

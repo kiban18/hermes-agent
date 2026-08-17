@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -243,6 +244,112 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_needs_input_block_subscribes_profile_home_before_event(
+    monkeypatch, worker_env,
+):
+    """Unattended workers must surface human-input blockers to a home channel.
+
+    The subscription cursor has to precede the blocked event; subscribing after
+    the transition would mark that event as already seen.
+    """
+    from gateway import config as gateway_config
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    class _Platform:
+        value = "telegram"
+
+    class _Home:
+        chat_id = "home-42"
+        thread_id = None
+        user_id = None
+
+    class _GatewayConfig:
+        def get_connected_platforms(self):
+            return [_Platform()]
+
+        def get_home_channel(self, platform):
+            return _Home()
+
+    monkeypatch.setattr(
+        gateway_config, "load_gateway_config", lambda: _GatewayConfig()
+    )
+    profile_config = (
+        Path(os.environ["HERMES_HOME"])
+        / "profiles/test-worker/config.yaml"
+    )
+    profile_config.parent.mkdir(parents=True)
+    profile_config.write_text(
+        "platforms:\n"
+        "  telegram:\n"
+        "    enabled: true\n"
+        "    home_channel:\n"
+        "      chat_id: home-42\n",
+        encoding="utf-8",
+    )
+
+    out = kt._handle_block({
+        "reason": "representative approval required",
+        "kind": "needs_input",
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["subscribed"] is True
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, worker_env)[0]
+        blocked = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "blocked"
+        ][-1]
+        assert sub["platform"] == "telegram"
+        assert sub["chat_id"] == "home-42"
+        assert sub["notifier_profile"] == "test-worker"
+        assert sub["delivery_mode"] == "notify+wake"
+        assert sub["last_event_id"] < blocked.id
+    finally:
+        conn.close()
+
+
+def test_rejected_needs_input_block_does_not_subscribe(
+    monkeypatch, worker_env,
+):
+    """A stale worker must not attach a route when its block CAS fails."""
+    from gateway import config as gateway_config
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    class _Platform:
+        value = "telegram"
+
+    class _Home:
+        chat_id = "home-42"
+        thread_id = None
+        user_id = None
+
+    class _GatewayConfig:
+        def get_connected_platforms(self):
+            return [_Platform()]
+
+        def get_home_channel(self, platform):
+            return _Home()
+
+    monkeypatch.setattr(
+        gateway_config, "load_gateway_config", lambda: _GatewayConfig()
+    )
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+
+    out = kt._handle_block({
+        "reason": "representative approval required",
+        "kind": "needs_input",
+    })
+    assert json.loads(out)["error"]
+
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn, worker_env) == []
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
