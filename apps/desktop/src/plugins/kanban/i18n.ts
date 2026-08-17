@@ -164,6 +164,7 @@ type KanbanMessages = {
   working: string
   // board switcher
   board: string
+  allBoards: string
   newBoard: string
   newBoardDots: string
   boardSettings: string
@@ -366,6 +367,7 @@ export const en: KanbanMessages = {
   close: 'Close',
   working: 'working',
   board: 'Board',
+  allBoards: 'All boards',
   newBoard: 'New board',
   newBoardDots: 'New board…',
   boardSettings: 'Board settings…',
@@ -567,6 +569,7 @@ const ja: KanbanMessages = {
   close: '閉じる',
   working: '作業中',
   board: 'ボード',
+  allBoards: 'すべてのボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
   boardSettings: 'ボード設定…',
@@ -766,6 +769,7 @@ const zh: KanbanMessages = {
   close: '关闭',
   working: '进行中',
   board: '面板',
+  allBoards: '全部面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
   boardSettings: '面板设置…',
@@ -964,6 +968,7 @@ const zhHant: KanbanMessages = {
   close: '關閉',
   working: '進行中',
   board: '面板',
+  allBoards: '全部面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
   boardSettings: '面板設定…',

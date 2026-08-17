@@ -224,7 +224,7 @@ export function BoardSwitcher() {
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />
-          {current && (
+          {current && !current.virtual && (
             <DropdownMenuItem onSelect={() => setSettingsFor(current)}>
               <Codicon name="settings-gear" size="0.8rem" />
               {k.boardSettings}

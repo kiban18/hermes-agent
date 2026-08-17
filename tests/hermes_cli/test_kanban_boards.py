@@ -342,5 +342,13 @@ class TestCLI:
         assert titlesB == ["Task B"]
         assert titlesD == []
 
+        listed = _cli(["list", "--board", "*", "--json"], env_extra=env)
+        assert listed.returncode == 0, listed.stderr
+        titles_all = {t["title"] for t in json.loads(listed.stdout)}
+        assert titles_all == {"Task A", "Task B"}
+        slugs = {t["title"]: t.get("board_slug") for t in json.loads(listed.stdout)}
+        assert slugs["Task A"] == "proja"
+        assert slugs["Task B"] == "projb"
+
 
 

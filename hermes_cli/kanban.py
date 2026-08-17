@@ -429,6 +429,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
+    p_list.add_argument(
+        "--board",
+        nargs="*",
+        default=None,
+        dest="board_slugs",
+        help="Board slug(s) to query. Defaults to the active board. "
+             "Use '*' to query all boards.",
+    )
     p_list.add_argument("--mine", action="store_true",
                         help="Filter by $HERMES_PROFILE as assignee")
     p_list.add_argument("--assignee", default=None)
@@ -1185,6 +1193,11 @@ def _profile_author() -> str:
         return "user"
 
 
+def _gateway_profile_scope() -> Optional[str]:
+    """Scope passive board reads made from a messaging gateway."""
+    return _profile_author() if os.environ.get("_HERMES_GATEWAY") == "1" else None
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
@@ -1644,47 +1657,112 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    from . import kanban_aggregator as ka
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn,
+    elif not assignee:
+        assignee = _gateway_profile_scope()
+
+    # List-only ``--board`` uses dest=board_slugs so it does not shadow the
+    # global ``hermes kanban --board SLUG`` pin (dest=board) used by create
+    # and every other verb.
+    board_tokens = [
+        str(item).strip()
+        for item in (getattr(args, "board_slugs", None) or [])
+        if str(item).strip()
+    ]
+    multi_board = "*" in board_tokens or len(board_tokens) > 1
+    try:
+        all_boards_on_disk = kb.list_boards(include_archived=False)
+    except Exception:
+        all_boards_on_disk = []
+
+    if multi_board:
+        tasks = ka.query_multiple_boards(
+            boards=board_tokens or ["*"],
             assignee=assignee,
             status=args.status,
             tenant=args.tenant,
-            session_id=args.session,
+            query=getattr(args, "query", None),
             include_archived=args.archived,
-            order_by=getattr(args, "sort", None),
-            workflow_template_id=args.workflow_template_id,
-            current_step_key=args.current_step_key,
+            sort_by=(getattr(args, "sort", None) or "priority"),
         )
+    else:
+        # One explicit slug, or the global/env/current pin.
+        board_slug = board_tokens[0] if board_tokens else None
+        with kb.connect_closing(board=board_slug) as conn:
+            # Cheap "mini-dispatch": recompute ready so list output reflects
+            # dependencies that may have cleared since the last dispatcher tick.
+            kb.recompute_ready(conn)
+            tasks = kb.list_tasks(
+                conn,
+                assignee=assignee,
+                status=args.status,
+                tenant=args.tenant,
+                session_id=args.session,
+                include_archived=args.archived,
+                order_by=getattr(args, "sort", None),
+                workflow_template_id=args.workflow_template_id,
+                current_step_key=args.current_step_key,
+            )
+
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        # Convert dataclass to dict for JSON serialization
+        task_dicts = []
+        for t in tasks:
+            d = dict(t.__dict__)
+            if multi_board:
+                d["board_slug"] = getattr(t, "board_slug", "")
+            task_dicts.append(d)
+        print(json.dumps(task_dicts, indent=2, ensure_ascii=False))
         return 0
-    # Passive discoverability: when the user has multiple boards, surface
-    # which one they're looking at in the list header. Single-board users
-    # never see this — the feature stays invisible until you opt in.
-    try:
-        all_boards = kb.list_boards(include_archived=False)
-    except Exception:
-        all_boards = []
-    if len(all_boards) > 1:
+
+    # Passive discoverability for multiple boards.
+    if len(all_boards_on_disk) > 1 and not multi_board:
         current = kb.get_current_board()
-        other_count = len(all_boards) - 1
+        other_count = len(all_boards_on_disk) - 1
         print(
             f"Board: {current} "
             f"({other_count} other board{'s' if other_count != 1 else ''} — "
             f"`hermes kanban boards list`)\n"
         )
+
     if not tasks:
         print("(no matching tasks)")
         return 0
+
+    headers = ["ID", "Status", "Priority", "Assignee", "Title"]
+    if multi_board:
+        headers.insert(1, "Board")
+
+    rows = []
     for t in tasks:
-        print(_fmt_task_line(t))
+        row = [t.id, t.status, str(t.priority), t.assignee or "—", t.title]
+        if multi_board:
+            row.insert(1, getattr(t, "board_slug", ""))
+        rows.append(row)
+
+    # Simple table formatting
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(str(cell)))
+    
+    header_line = "  ".join(h.ljust(w) for h, w in zip(headers, col_widths))
+    print(header_line)
+    print("─" * len(header_line))
+
+    for row in rows:
+        formatted_row = []
+        for i, cell in enumerate(row):
+            # Right-align Priority column
+            if headers[i] == "Priority":
+                formatted_row.append(str(cell).rjust(col_widths[i]))
+            else:
+                formatted_row.append(str(cell).ljust(col_widths[i]))
+        print("  ".join(formatted_row))
+
     return 0
 
 
@@ -2299,19 +2377,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            try:
-                completed = kb.complete_task(
-                    conn, tid,
-                    result=args.result,
-                    summary=summary,
-                    metadata=metadata,
-                    expected_run_id=_worker_run_id_for(tid),
-                )
-            except kb.ApprovalOwnerRequiredError as exc:
-                failed.append(tid)
-                print(f"kanban: {exc}", file=sys.stderr)
-                continue
-            if not completed:
+            if not kb.complete_task(
+                conn, tid,
+                result=args.result,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2932,7 +3004,23 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        stats = kb.board_stats(conn)
+        profile = _gateway_profile_scope()
+        if profile:
+            tasks = kb.list_tasks(conn, assignee=profile, include_archived=False)
+            counts: dict[str, int] = {}
+            for task in tasks:
+                counts[task.status] = counts.get(task.status, 0) + 1
+            now = int(time.time())
+            ready = [task.created_at for task in tasks if task.status == "ready"]
+            stats = {
+                "by_status": counts,
+                "by_assignee": {profile: counts} if counts else {},
+                "oldest_ready_age_seconds": now - min(ready) if ready else None,
+                "now": now,
+                "scope": {"assignee": profile},
+            }
+        else:
+            stats = kb.board_stats(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0

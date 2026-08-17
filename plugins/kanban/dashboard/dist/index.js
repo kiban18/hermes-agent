@@ -278,6 +278,11 @@
   // can inspect any board without shifting the CLI's active board out
   // from under a terminal they left open.
   const LS_BOARD_KEY = "hermes.kanban.selectedBoard";
+  const ALL_BOARDS_SLUG = "*";
+
+  function isAllBoards(slug) {
+    return slug === ALL_BOARDS_SLUG;
+  }
 
   function readSelectedBoard() {
     try {
@@ -695,6 +700,7 @@
     const [assigneeFilter, setAssigneeFilter] = useState("");
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
+    const [sortOrder, setSortOrder] = useState("priority");
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
@@ -712,6 +718,7 @@
     const [taskEventTick, setTaskEventTick] = useState({});
 
     const cursorRef = useRef(0);
+    const loadRequestRef = useRef(0);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
@@ -734,21 +741,39 @@
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      const requestId = ++loadRequestRef.current;
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
+      if (sortOrder !== "priority") qs.set("sort", sortOrder);
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
+          if (requestId !== loadRequestRef.current) return;
           setBoardData(data);
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
         })
         .catch(function (err) {
+          if (requestId !== loadRequestRef.current) return;
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+        .finally(function () {
+          if (requestId === loadRequestRef.current) setLoading(false);
+        });
+    }, [tenantFilter, includeArchived, sortOrder, board]);
+
+    const boardForTask = useCallback(function (taskId) {
+      if (!isAllBoards(board)) return board;
+      const cols = (boardData && boardData.columns) || [];
+      for (let i = 0; i < cols.length; i++) {
+        const tasks = cols[i].tasks || [];
+        for (let j = 0; j < tasks.length; j++) {
+          if (tasks[j].id === taskId && tasks[j].board_slug) return tasks[j].board_slug;
+        }
+      }
+      return board;
+    }, [board, boardData]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -758,13 +783,16 @@
           const storedBoard = readSelectedBoard();
           setBoardList(boards);
           if (!storedBoard && !board && data && data.current) {
-            setBoard(data.current);
+            const all = boards.find(function (b) { return isAllBoards(b.slug); });
+            const next = all ? all.slug : data.current;
+            setBoard(next);
+            if (all) writeSelectedBoard(next);
             return;
           }
           // If the stored slug isn't in the list any longer (board was
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
-          if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
+          if (board && board !== "default" && !isAllBoards(board) && !boards.find(function (b) { return b.slug === board; })) {
             setBoard("default");
             writeSelectedBoard("default");
           }
@@ -915,7 +943,7 @@
           return Object.assign({}, b, { columns });
         });
         const ids = Array.from(selectedIds);
-        SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
+        SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, boardForTask(ids[0]) || board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
@@ -954,7 +982,7 @@
         }
         return Object.assign({}, b, { columns });
       });
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, boardForTask(taskId)), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(finalPatch),
@@ -962,7 +990,7 @@
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
-    }, [loadBoard, board, t, selectedIds]);
+    }, [loadBoard, board, t, selectedIds, boardForTask]);
 
     // Pre-dispatch dialog step for both moveTask and moveSelected. Drives
     // the new in-app ConfirmDialog instead of window.confirm. The flow:
@@ -1272,7 +1300,7 @@
        destructive: true,
      }).then(function (r) {
        if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, boardForTask(taskId)), {
          method: "DELETE",
        }).then(function () {
          loadBoard();
@@ -1298,7 +1326,7 @@
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
         return Promise.all(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, boardForTask(id)), { method: "DELETE" });
         })).then(function () {
           loadBoard();
         }).catch(function (e) { setError(String(e.message || e)); });
@@ -1360,6 +1388,7 @@
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
+          sortOrder, setSortOrder,
           laneByProfile, setLaneByProfile,
           search, setSearch,
           onNudgeDispatch: function () {
@@ -1404,7 +1433,7 @@
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
-          boardSlug: board,
+          boardSlug: boardForTask(selectedTaskId),
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
@@ -2196,20 +2225,20 @@
         ),
         h("div", { className: "flex-1" }),
         h(DocsLink, null),
-        h(Button, {
+        current && !current.virtual && !isAllBoards(props.board) ? h(Button, {
           onClick: props.onSettingsClick,
           size: "sm",
           className: "h-8",
           title: tx(t, "boardSettingsTitle",
             "Board settings — name, description, and the default project directory new tasks inherit"),
-        }, tx(t, "boardSettings", "Settings")),
+        }, tx(t, "boardSettings", "Settings")) : null,
         h(Button, {
           onClick: props.onNewClick,
           size: "sm",
           className: "h-8",
           title: "Create a new board. Useful when you want an unrelated work stream (different project, different team, isolated scratch area).",
         }, tx(t, "newBoard", "+ New board")),
-        props.board !== "default"
+        props.board !== "default" && !isAllBoards(props.board)
           ? h(Button, {
             onClick: function () {
               const msg = tx(t, "archiveBoardConfirm",
@@ -2517,12 +2546,23 @@
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "assignee", "Assignee")),
         h(Select, Object.assign({
           value: props.assigneeFilter,
-          className: "h-8",
+          className: "h-8 w-60",
         }, selectChangeHandler(props.setAssigneeFilter)),
           h(SelectOption, { value: "" }, tx(t, "allProfiles", "All profiles")),
           assignees.map(function (a) {
             return h(SelectOption, { key: a, value: a }, a);
           }),
+        ),
+      ),
+      h("div", { className: "flex flex-col gap-1",
+                 title: "Order cards within each status column. Recent status change ignores comments and edits." },
+        h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "sort", "Sort")),
+        h(Select, Object.assign({
+          value: props.sortOrder,
+          className: "h-8",
+        }, selectChangeHandler(props.setSortOrder)),
+          h(SelectOption, { value: "priority" }, tx(t, "sortPriority", "Priority")),
+          h(SelectOption, { value: "status_changed" }, tx(t, "sortRecentStatus", "Recent status change")),
         ),
       ),
       h("label", { className: "flex items-center gap-2 text-xs",
@@ -2902,9 +2942,9 @@
     // Listen for our synthetic touch-drop events from attachTouchDrag().
     useEffect(function () {
       if (!colRef.current) return undefined;
-      if (isVirtual) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
+        if (isVirtual) return;
         if (e.detail && e.detail.status === props.column.name) {
           const taskId = e.detail.taskId;
           if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1 && props.onMoveSelected) {
@@ -2916,17 +2956,15 @@
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected, isVirtual]);
+    }, [isVirtual, props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
 
     const handleDragOver = function (e) {
-      if (isVirtual) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
-      if (isVirtual) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -2960,9 +2998,9 @@
         "hermes-kanban-column",
         dragOver ? "hermes-kanban-column--drop" : "",
       ),
-      onDragOver: handleDragOver,
-      onDragLeave: handleDragLeave,
-      onDrop: handleDrop,
+      onDragOver: isVirtual ? undefined : handleDragOver,
+      onDragLeave: isVirtual ? undefined : handleDragLeave,
+      onDrop: isVirtual ? undefined : handleDrop,
     },
       h("div", { className: "hermes-kanban-column-header",
                  title: colHelp || "" },
@@ -2971,9 +3009,7 @@
           title: "Select all tasks in this column",
           "aria-label": `Select all tasks in ${colLabel || props.column.name}`,
           checked: props.column.tasks.length > 0 && props.column.tasks.every(function (t) { return props.selectedIds.has(t.id); }),
-          disabled: isVirtual,
           onCheckedChange: function () {
-            if (isVirtual) return;
             if (props.selectAllInColumn) props.selectAllInColumn(props.column.name);
           },
           onClick: function (e) { e.stopPropagation(); },
@@ -2993,7 +3029,7 @@
       ),
       h("div", { className: "hermes-kanban-column-sub" },
         colHelp || ""),
-      showCreate ? h(InlineCreate, {
+      showCreate && !isVirtual ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
         defaultWorkspaceKind: (props.boardMeta && props.boardMeta.default_workspace_kind) || "scratch",
@@ -3074,9 +3110,8 @@
     const cardRef = useRef(null);
 
     useEffect(function () {
-      if (t.representative_action_required) return undefined;
       return attachTouchDrag(cardRef.current, t.id, t.status);
-    }, [t.id, t.status, t.representative_action_required]);
+    }, [t.id, t.status]);
 
     const handleDragStart = function (e) {
       e.dataTransfer.setData(MIME_TASK, t.id);
@@ -3094,10 +3129,6 @@
       }
     };
     const handleClick = function (e) {
-      if (t.representative_action_required) {
-        props.onOpen(t.id);
-        return;
-      }
       if (e.shiftKey) {
         e.preventDefault();
         e.stopPropagation();
@@ -3122,7 +3153,6 @@
       }
     };
     const handleCheckedChange = function () {
-      if (t.representative_action_required) return;
       props.toggleSelected(t.id, true);
     };
 
@@ -3139,7 +3169,7 @@
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
-      draggable: !t.representative_action_required,
+      draggable: true,
       tabIndex: 0,
       role: "button",
       "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
@@ -3158,7 +3188,6 @@
               h(Checkbox, {
                 className: "hermes-kanban-card-check",
                 checked: props.selected,
-                disabled: t.representative_action_required,
                 onCheckedChange: handleCheckedChange,
                 onClick: function (e) { e.stopPropagation(); },
                 "aria-label": `Select task ${t.id}`,
@@ -3188,6 +3217,10 @@
             t.tenant
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
+              : null,
+            t.board_slug
+              ? h(Badge, { variant: "outline", className: "hermes-kanban-tag hermes-kanban-board-slug",
+                           title: `Board: ${t.board_slug}` }, t.board_slug)
               : null,
             progress
               ? h("span", {

@@ -1141,6 +1141,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Not a DB column. Filled by multi-board aggregation so a consolidated
+    # list/dashboard view can say which file a card came from.
+    board_slug: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":

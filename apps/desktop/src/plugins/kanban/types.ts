@@ -19,6 +19,8 @@ export interface KanbanTask {
   progress?: null | { done: number; total: number }
   /** Compact diagnostics rollup — present only when a card has warnings. */
   warnings?: null | { count: number; highest_severity?: null | string }
+  /** Owning board slug. Present on every card; used by the all-boards view. */
+  board_slug?: null | string
   /** Worker liveness (present on running cards) — drives the arc + run clock. */
   started_at?: null | number
   worker_pid?: null | number
@@ -137,6 +139,8 @@ export interface BoardMeta {
   /** First-class Project the board is scoped to (id) + resolved name. */
   project_id?: null | string
   project_name?: null | string
+  /** True for the synthetic All boards row — not a writable slug. */
+  virtual?: boolean
 }
 
 /** GET /projects — first-class Hermes projects available to scope a board. */
