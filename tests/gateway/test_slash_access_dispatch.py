@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
@@ -108,6 +108,75 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
+
+
+@pytest.mark.asyncio
+async def test_telegram_home_kanban_approve_is_the_representative_gate(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        approval = kb.create_task(
+            conn,
+            title="payment approval",
+            body="승인 주체: 대표",
+            assignee="default",
+        )
+        child = kb.create_task(conn, title="pay", parents=[approval])
+
+    runner = _make_runner(platform=Platform.TELEGRAM)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="8698415552",
+        user_id="8698415552",
+        name="Representative",
+    )
+    event = _make_event(
+        f"/kanban approve {approval}",
+        _make_source(
+            platform=Platform.TELEGRAM,
+            user_id="8698415552",
+            chat_id="8698415552",
+        ),
+    )
+
+    result = await runner._handle_kanban_command(event)
+
+    assert result == f"✅ 대표 승인 완료: {approval} — payment approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, approval).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+        completed = [e for e in kb.list_events(conn, approval) if e.kind == "completed"][-1]
+        assert completed.payload["representative_approval"] == "telegram:m1"
+
+
+@pytest.mark.asyncio
+async def test_kanban_approve_rejects_non_home_telegram(monkeypatch, tmp_path):
+    runner = _make_runner(platform=Platform.TELEGRAM)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home",
+        user_id="owner",
+        name="Representative",
+    )
+    result = await runner._handle_kanban_command(
+        _make_event(
+            "/kanban approve t_deadbeef",
+            _make_source(
+                platform=Platform.TELEGRAM,
+                user_id="other",
+                chat_id="home",
+            ),
+        )
+    )
+    assert "대표 비서실장 Telegram 홈 채널" in result
 
 
 # ---------------------------------------------------------------------------

@@ -501,6 +501,60 @@ class GatewaySlashCommandsMixin:
             action = tok
             break
 
+        if action == "approve":
+            source = event.source
+            platform = getattr(source, "platform", None)
+            platform_str = (
+                platform.value if hasattr(platform, "value") else str(platform or "")
+            ).lower()
+            home = self.config.get_home_channel(Platform.TELEGRAM)
+            source_chat_id = str(getattr(source, "chat_id", "") or "")
+            source_user_id = str(getattr(source, "user_id", "") or "")
+            if (
+                self._active_profile_name() != "default"
+                or platform_str != "telegram"
+                or home is None
+                or source_chat_id != str(home.chat_id or "")
+                or (home.user_id and source_user_id != str(home.user_id))
+            ):
+                return "⛔ 대표 비서실장 Telegram 홈 채널에서만 승인할 수 있습니다."
+
+            task_ids = [token for token in tokens if re.fullmatch(r"t_[0-9a-f]+", token)]
+            if len(task_ids) != 1:
+                return "사용법: /kanban approve <카드 ID>"
+            task_id = task_ids[0]
+            message_id = str(getattr(event, "message_id", "") or "direct")
+
+            def _approve_representative_task() -> str:
+                from hermes_cli import kanban_db as _kb
+
+                conn = _kb.connect(board=requested_board)
+                try:
+                    task = _kb.get_task(conn, task_id)
+                    if task is None:
+                        return f"카드를 찾을 수 없습니다: {task_id}"
+                    if not _kb.representative_approval_required(conn, task_id):
+                        return f"대표 승인 카드가 아닙니다: {task_id} — {task.title}"
+                    ok = _kb.complete_task(
+                        conn,
+                        task_id,
+                        summary=f"대표가 Telegram에서 승인함: {task.title}",
+                        representative_approval=f"telegram:{message_id}",
+                    )
+                    if not ok:
+                        return (
+                            f"승인할 수 없습니다: {task_id} — {task.title} "
+                            "(선행 카드 또는 현재 상태를 확인하세요)"
+                        )
+                    return f"✅ 대표 승인 완료: {task_id} — {task.title}"
+                finally:
+                    conn.close()
+
+            try:
+                return await asyncio.to_thread(_approve_representative_task)
+            except Exception as exc:
+                return t("gateway.kanban.error_prefix", error=exc)
+
         is_create = action == "create"
 
         try:
@@ -543,6 +597,16 @@ class GatewaySlashCommandsMixin:
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
+                                task = _kb.get_task(conn, task_id)
+                                for existing in _kb.list_notify_subs(conn, task_id):
+                                    if (
+                                        task and task.assignee
+                                        and existing.get("platform") == platform_str
+                                        and existing.get("chat_id") == chat_id
+                                        and (existing.get("thread_id") or "") == (thread_id or "")
+                                        and existing.get("notifier_profile") == task.assignee
+                                    ):
+                                        return
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
