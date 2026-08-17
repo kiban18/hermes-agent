@@ -72,7 +72,9 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == (kb.VALID_STATUSES - {"archived"}) | {
+        "representative_action",
+    }
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
@@ -161,6 +163,36 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
     assert any(t["id"] == task["id"] for t in columns["scheduled"])
     assert not any(t["id"] == task["id"] for t in columns["todo"])
+
+
+def test_representative_human_action_is_separate_from_blocked(client):
+    with kb.connect() as conn:
+        human_action_id = kb.create_task(
+            conn,
+            title="Send the approved client message",
+            body="사람 실행자: 대표",
+            assignee="project_lead",
+        )
+        ordinary_blocked_id = kb.create_task(
+            conn,
+            title="사람 실행자: 대표",
+            initial_status="blocked",
+        )
+
+    response = client.get("/api/plugins/kanban/board")
+    assert response.status_code == 200
+    columns = {c["name"]: c["tasks"] for c in response.json()["columns"]}
+
+    assert [task["id"] for task in columns["representative_action"]] == [
+        human_action_id,
+    ]
+    assert ordinary_blocked_id in [task["id"] for task in columns["blocked"]]
+    assert human_action_id not in [task["id"] for task in columns["blocked"]]
+    assert columns["representative_action"][0]["status"] == "blocked"
+    assert columns["representative_action"][0][
+        "representative_action_required"
+    ] is True
+    assert columns["representative_action"][0]["assignee"] == "project_lead"
 
 
 def test_tenant_filter(client):
@@ -1228,5 +1260,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

@@ -238,6 +238,23 @@ SKILLS_GUIDANCE = (
     "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
 )
 
+REPRESENTATIVE_ACTION_GUIDANCE = (
+    "# Representative action cards\n"
+    "A task whose body contains the exact standalone line `사람 실행자: 대표` "
+    "is waiting for the representative to perform a real-world human action. "
+    "It is not a representative-approval card: keep its canonical status as "
+    "`blocked`, keep the assigned profile as the result owner, do not perform "
+    "the human action, do not reassign it to `default` or "
+    "`executive_coordinator`, and do not use `/kanban approve`.\n"
+    "The assigned profile prepares the exact action and completion checklist. "
+    "When the representative supplies execution evidence in a comment or log, "
+    "the assigned profile verifies it, records the verification on the card, "
+    "and completes the card when its acceptance criteria are met. Unblock only "
+    "when automated follow-up work must resume. In status reports, list these "
+    "cards separately under `대표 실행 대기` with the card id, requested human "
+    "action, result owner, and missing completion evidence."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

@@ -87,7 +87,7 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "representative_action", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -96,6 +96,7 @@
     todo: "Todo",
     ready: "Ready",
     running: "In Progress",
+    representative_action: "대표 할 일",
     blocked: "Blocked",
     review: "Review",
     done: "Done",
@@ -106,6 +107,7 @@
     todo: "Waiting on dependencies or unassigned",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
+    representative_action: "대표가 직접 실행하면 담당 프로필이 확인하고 완료",
     blocked: "Worker asked for human input",
     review: "Implementation complete — awaiting review",
     done: "Completed",
@@ -174,6 +176,7 @@
     todo: "hermes-kanban-dot-todo",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
+    representative_action: "hermes-kanban-dot-blocked",
     blocked: "hermes-kanban-dot-blocked",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
@@ -2894,10 +2897,12 @@
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
     const colRef = useRef(null);
+    const isVirtual = props.column.name === "representative_action";
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
     useEffect(function () {
       if (!colRef.current) return undefined;
+      if (isVirtual) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
         if (e.detail && e.detail.status === props.column.name) {
@@ -2911,15 +2916,17 @@
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
+    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected, isVirtual]);
 
     const handleDragOver = function (e) {
+      if (isVirtual) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
+      if (isVirtual) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -2964,7 +2971,9 @@
           title: "Select all tasks in this column",
           "aria-label": `Select all tasks in ${colLabel || props.column.name}`,
           checked: props.column.tasks.length > 0 && props.column.tasks.every(function (t) { return props.selectedIds.has(t.id); }),
+          disabled: isVirtual,
           onCheckedChange: function () {
+            if (isVirtual) return;
             if (props.selectAllInColumn) props.selectAllInColumn(props.column.name);
           },
           onClick: function (e) { e.stopPropagation(); },
@@ -2975,7 +2984,7 @@
         h("span", { className: "hermes-kanban-column-count",
                     title: `${props.column.tasks.length} task${props.column.tasks.length === 1 ? "" : "s"} in this column` },
           props.column.tasks.length),
-        h("button", {
+        isVirtual ? null : h("button", {
           type: "button",
           className: "hermes-kanban-column-add",
           title: tx(t, "createTask", "Create task in this column"),
@@ -3065,8 +3074,9 @@
     const cardRef = useRef(null);
 
     useEffect(function () {
+      if (t.representative_action_required) return undefined;
       return attachTouchDrag(cardRef.current, t.id, t.status);
-    }, [t.id, t.status]);
+    }, [t.id, t.status, t.representative_action_required]);
 
     const handleDragStart = function (e) {
       e.dataTransfer.setData(MIME_TASK, t.id);
@@ -3084,6 +3094,10 @@
       }
     };
     const handleClick = function (e) {
+      if (t.representative_action_required) {
+        props.onOpen(t.id);
+        return;
+      }
       if (e.shiftKey) {
         e.preventDefault();
         e.stopPropagation();
@@ -3108,6 +3122,7 @@
       }
     };
     const handleCheckedChange = function () {
+      if (t.representative_action_required) return;
       props.toggleSelected(t.id, true);
     };
 
@@ -3124,7 +3139,7 @@
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
-      draggable: true,
+      draggable: !t.representative_action_required,
       tabIndex: 0,
       role: "button",
       "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
@@ -3143,6 +3158,7 @@
               h(Checkbox, {
                 className: "hermes-kanban-card-check",
                 checked: props.selected,
+                disabled: t.representative_action_required,
                 onCheckedChange: handleCheckedChange,
                 onClick: function (e) { e.stopPropagation(); },
                 "aria-label": `Select task ${t.id}`,

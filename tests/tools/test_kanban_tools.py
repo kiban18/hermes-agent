@@ -89,6 +89,12 @@ def test_list_filters_tasks(monkeypatch, worker_env):
         a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
         b = kb.create_task(conn, title="beta", assignee="reviewer")
         c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        representative = kb.create_task(
+            conn,
+            title="human send",
+            body="사람 실행자: 대표",
+            assignee="factory",
+        )
     finally:
         conn.close()
 
@@ -109,6 +115,17 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
     assert tenant_ids == [c]
+
+    blocked_out = json.loads(kt._handle_list({
+        "assignee": "factory",
+        "status": "blocked",
+    }))
+    assert [t["id"] for t in blocked_out["tasks"]] == [representative]
+    assert blocked_out["tasks"][0]["representative_action_required"] is True
+
+    shown = json.loads(kt._handle_show({"task_id": representative}))
+    assert shown["task"]["representative_action_required"] is True
+    assert "Representative action: pending" in shown["worker_context"]
 
 
 def test_complete_happy_path(worker_env):

@@ -3155,6 +3155,21 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_REPRESENTATIVE_ACTION_RE = re.compile(
+    r"^\s*사람 실행자\s*:\s*대표\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _representative_action_declared(body: Optional[str]) -> bool:
+    return bool(_REPRESENTATIVE_ACTION_RE.search(body or ""))
+
+
+def representative_action_required(task: Task) -> bool:
+    """Whether *task* is waiting for the representative's real-world action."""
+    return task.status == "blocked" and _representative_action_declared(task.body)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3188,9 +3203,11 @@ def create_task(
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
-    If ``triage=True``, status is forced to ``triage`` regardless of
+    If ``triage=True``, status is normally forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    ``todo`` once the spec is fleshed out. The explicit ``사람 실행자: 대표``
+    marker takes precedence because a fully identified human action must wait
+    in the representative-action gate rather than enter automated triage.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -3231,6 +3248,11 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    representative_action_hold = _representative_action_declared(body)
+    if representative_action_hold and not assignee:
+        raise ValueError(
+            "a representative-action task requires an assignee result owner"
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3441,7 +3463,13 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                if representative_action_hold:
+                    task_status = "blocked"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -3526,6 +3554,12 @@ def create_task(
                         session_id,
                     ),
                 )
+                if representative_action_hold:
+                    conn.execute(
+                        "UPDATE tasks SET block_kind = 'needs_input', "
+                        "block_recurrences = 1 WHERE id = ?",
+                        (task_id,),
+                    )
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3554,6 +3588,21 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if representative_action_hold:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": (
+                                "대표의 실제 실행을 기다립니다. 담당 프로필은 준비와 "
+                                "실행 증거 확인을 책임지고, 증거 확인 뒤 카드를 완료하세요."
+                            ),
+                            "kind": "needs_input",
+                            "source_status": "created",
+                            "representative_action": True,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -5349,6 +5398,23 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class ApprovalOwnerRequiredError(ValueError):
+    """Raised when a profile tries to complete another owner's action."""
+
+
+def _active_approval_actor() -> str:
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5393,6 +5459,32 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    task = get_task(conn, task_id)
+    if (
+        task
+        and _representative_action_declared(task.body)
+        and task.status not in {"done", "archived"}
+    ):
+        result_owner = str(task.assignee or "").strip()
+        actor = _active_approval_actor()
+        if not result_owner or actor != result_owner:
+            with write_txn(conn, allow_nested=True):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_approval_owner",
+                    {
+                        "required_owner": result_owner or None,
+                        "attempted_by": actor,
+                        "representative_action": True,
+                        "worker_task_id": os.environ.get("HERMES_KANBAN_TASK"),
+                    },
+                )
+            raise ApprovalOwnerRequiredError(
+                "representative-action completion belongs to "
+                f"{result_owner or 'the assigned result owner'}; current profile "
+                f"{actor} cannot complete it"
+            )
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -11047,6 +11139,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if representative_action_required(task):
+        lines.append("Representative action: pending")
+        lines.append(
+            "Follow-up: do not perform the human action or request /kanban approve; "
+            "keep ownership, verify the representative's evidence, then complete "
+            "the card when its acceptance criteria are satisfied."
+        )
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

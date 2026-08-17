@@ -53,7 +53,11 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    representative = " [대표 실행 대기]" if kb.representative_action_required(t) else ""
+    return (
+        f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  "
+        f"{t.title}{representative}"
+    )
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -63,6 +67,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "representative_action_required": kb.representative_action_required(t),
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -1751,6 +1756,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if kb.representative_action_required(task):
+        print("  human:     representative action pending")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -2292,13 +2299,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.ApprovalOwnerRequiredError as exc:
+                failed.append(tid)
+                print(f"kanban: {exc}", file=sys.stderr)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

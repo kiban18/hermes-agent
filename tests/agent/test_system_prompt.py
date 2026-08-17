@@ -72,6 +72,15 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_representative_action_guidance_is_injected_for_every_profile():
+    prompt = _stable_prompt(_make_agent(valid_tool_names=[]))
+    assert prompt.count("# Representative action cards") == 1
+    assert "사람 실행자: 대표" in prompt
+    assert "keep the assigned profile as the result owner" in prompt
+    assert "do not use `/kanban approve`" in prompt
+    assert "`대표 실행 대기`" in prompt
+
+
 def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
@@ -298,6 +307,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        system_prompt.REPRESENTATIVE_ACTION_GUIDANCE,
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -327,7 +337,13 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join((
+        "IDENTITY",
+        "HELP",
+        system_prompt.REPRESENTATIVE_ACTION_GUIDANCE,
+        "STEER",
+        "CODING_STABLE",
+    ))
 
 
 class TestTelegramRichMessagesHint:

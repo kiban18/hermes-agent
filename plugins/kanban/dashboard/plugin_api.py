@@ -147,8 +147,10 @@ def _conn(board: Optional[str] = None):
 # if it is omitted here, the board-level fallback below mis-buckets scheduled
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
+REPRESENTATIVE_ACTION_COLUMN = "representative_action"
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running",
+    REPRESENTATIVE_ACTION_COLUMN, "blocked", "review", "done",
 ]
 
 
@@ -172,6 +174,9 @@ def _task_dict(
     # ``task_runs.summary`` (the kanban-worker pattern) instead of
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
+    d["representative_action_required"] = (
+        kanban_db.representative_action_required(task)
+    )
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -477,7 +482,10 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            if kanban_db.representative_action_required(t):
+                col = REPRESENTATIVE_ACTION_COLUMN
+            else:
+                col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -897,12 +905,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.ApprovalOwnerRequiredError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":

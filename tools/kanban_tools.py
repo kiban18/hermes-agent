@@ -491,6 +491,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "representative_action_required": kb.representative_action_required(task),
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -539,6 +540,9 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "representative_action_required": (
+                        kb.representative_action_required(t)
+                    ),
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
@@ -779,6 +783,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.ApprovalOwnerRequiredError as owner_err:
+                return tool_error(str(owner_err))
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -1722,7 +1728,8 @@ KANBAN_LIST_SCHEMA = {
         "List Kanban task summaries so an orchestrator profile can discover "
         "work to route. Supports the same core filters as the CLI: assignee, "
         "status, tenant, include_archived, and limit. Returns compact rows "
-        "with ids, title, status, assignee, priority, parent/child ids, and "
+        "with ids, title, status, assignee, representative-action flag, "
+        "priority, parent/child ids, and "
         "counts. Bounded to 50 rows by default, 200 max, with truncation "
         "metadata. Also recomputes ready tasks before listing, matching the "
         "CLI. Orchestrator-only — dispatcher-spawned task workers never see "

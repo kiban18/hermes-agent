@@ -151,6 +151,62 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
+def test_representative_action_is_a_sticky_human_gate_owned_by_assignee(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="send the prepared client message",
+            body="완료 기준: 발송 로그\n사람 실행자: 대표",
+            assignee="project_lead",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.assignee == "project_lead"
+        assert kb.representative_action_required(task) is True
+        assert kb.recompute_ready(conn) == 0
+
+        blocked = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"]
+        assert blocked[-1].payload["representative_action"] is True
+        assert "실제 실행" in blocked[-1].payload["reason"]
+
+        context = kb.build_worker_context(conn, task_id)
+        assert "Representative action: pending" in context
+        assert "do not perform the human action" in context
+        assert "/kanban approve" in context
+
+        monkeypatch.setenv("HERMES_PROFILE", "executive_coordinator")
+        with pytest.raises(kb.ApprovalOwnerRequiredError):
+            kb.complete_task(conn, task_id, summary="representative acted")
+
+        monkeypatch.setenv("HERMES_PROFILE", "project_lead")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="representative action evidence verified",
+        ) is True
+        assert kb.representative_action_required(kb.get_task(conn, task_id)) is False
+
+        with pytest.raises(ValueError, match="requires an assignee result owner"):
+            kb.create_task(
+                conn,
+                title="ownerless human action",
+                body="사람 실행자: 대표",
+            )
+
+        triage_id = kb.create_task(
+            conn,
+            title="human action cannot remain in triage",
+            body="사람 실행자: 대표",
+            assignee="ops_admin",
+            triage=True,
+        )
+        assert kb.get_task(conn, triage_id).status == "blocked"
+
+
 def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
@@ -1406,5 +1462,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
