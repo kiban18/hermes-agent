@@ -2866,6 +2866,7 @@ def run_conversation(
                             "completed": False,
                             "failed": True,
                             "error": _nous_msg,
+                            "failure_reason": "rate_limit",
                         }
                 except ImportError:
                     pass

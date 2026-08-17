@@ -2905,6 +2905,24 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_cached_nous_rate_limit_preserves_failure_reason(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "nous"
+        agent._try_activate_fallback = MagicMock(return_value=False)
+
+        with (
+            patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60),
+            patch("agent.nous_rate_guard.format_remaining", return_value="1m"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "rate_limit"
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",

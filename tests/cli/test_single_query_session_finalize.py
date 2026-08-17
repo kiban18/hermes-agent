@@ -108,6 +108,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
 
         def chat(self, query, images=None):
             calls.append(("chat", query, images))
+            self._last_chat_result = {"failed": False}
             return "done"
 
         def _print_exit_summary(self, clear_screen=True):
@@ -131,6 +132,52 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
         "summary",
         ("finalize", "single-query-session"),
     ]
+
+
+def test_human_single_query_main_propagates_kanban_rate_limit_exit(monkeypatch):
+    import cli as cli_mod
+
+    class _Console:
+        def print(self, *_args, **_kwargs):
+            pass
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = _Console()
+            self.session_id = "single-query-session"
+            self.agent = SimpleNamespace(
+                session_id="single-query-session",
+                platform="cli",
+            )
+            self._last_chat_result = None
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, _query, images=None):
+            self._last_chat_result = {
+                "final_response": "",
+                "failed": True,
+                "failure_reason": "rate_limit",
+            }
+
+        def _print_exit_summary(self, clear_screen=True):
+            pass
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    assert exc_info.value.code == KANBAN_RATE_LIMIT_EXIT_CODE
 
 
 def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):

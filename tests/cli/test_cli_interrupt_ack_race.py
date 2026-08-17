@@ -154,6 +154,25 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_chat_keeps_structured_turn_result_for_one_shot_exit_status():
+    cli = _make_cli()
+    agent = _StubAgent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        response = cli.chat("hello")
+
+    assert response == "turn finished normally"
+    assert cli._last_chat_result["completed"] is True
+
+
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
