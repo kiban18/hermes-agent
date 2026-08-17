@@ -1318,7 +1318,8 @@ class TestProfileArg:
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
 
         plist = gateway_cli.generate_launchd_plist()
-        program_args = plistlib.loads(plist.encode("utf-8"))["ProgramArguments"]
+        parsed_plist = plistlib.loads(plist.encode("utf-8"))
+        program_args = parsed_plist["ProgramArguments"]
 
         assert program_args == [
             "/usr/bin/python3",
@@ -1337,6 +1338,9 @@ class TestProfileArg:
             "--replace",
             "--external-supervisor",
         ]
+        assert parsed_plist["EnvironmentVariables"][
+            gateway_cli.EXTERNAL_GATEWAY_SUPERVISOR_ENV
+        ] == "1"
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"

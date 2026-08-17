@@ -4810,6 +4810,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>{EXTERNAL_GATEWAY_SUPERVISOR_ENV}</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
