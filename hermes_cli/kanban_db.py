@@ -3155,10 +3155,43 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_REPRESENTATIVE_APPROVAL_MARKERS = (
+    "승인 주체: 대표",
+    "대표 승인 필요: 예",
+    "approval_owner: representative",
+)
+_APPROVAL_OWNER_RE = re.compile(
+    r"^\s*승인 주체\s*:\s*([^\r\n]+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 _REPRESENTATIVE_ACTION_RE = re.compile(
     r"^\s*사람 실행자\s*:\s*대표\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+def _approval_owner_text(title: Optional[str], body: Optional[str]) -> Optional[str]:
+    text = f"{title or ''}\n{body or ''}"
+    match = _APPROVAL_OWNER_RE.search(text)
+    if not match:
+        return None
+    owner = match.group(1).strip()
+    if owner.casefold() in {"대표", "representative"}:
+        return "representative"
+    try:
+        return _canonical_assignee(owner)
+    except ValueError:
+        return owner.casefold()
+
+
+def _representative_approval_required_text(
+    title: Optional[str], body: Optional[str],
+) -> bool:
+    text = f"{title or ''}\n{body or ''}".casefold()
+    return (
+        _approval_owner_text(title, body) == "representative"
+        or any(marker in text for marker in _REPRESENTATIVE_APPROVAL_MARKERS)
+    )
 
 
 def _representative_action_declared(body: Optional[str]) -> bool:
@@ -3168,6 +3201,68 @@ def _representative_action_declared(body: Optional[str]) -> bool:
 def representative_action_required(task: Task) -> bool:
     """Whether *task* is waiting for the representative's real-world action."""
     return task.status == "blocked" and _representative_action_declared(task.body)
+
+
+_ORG_CARD_IDENTITY = Path(
+    "/Users/khlee/.hermes/shared-skills/organization-board-operator/scripts/card-identity.py"
+)
+
+
+def _reject_unidentified_org_title(
+    title: str,
+    *,
+    triage: bool,
+    board: Optional[str],
+    conn: sqlite3.Connection,
+    body: Optional[str] = None,
+) -> None:
+    """Fail closed on crazyup-fillgaps titles that hide the project."""
+    if triage:
+        return
+    slug = (board or "").strip()
+    if slug and slug != "crazyup-fillgaps":
+        return
+    if not slug:
+        try:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            path = row[2] if row is not None and len(row) > 2 else ""
+        except sqlite3.Error:
+            path = ""
+        if "crazyup-fillgaps" not in (path or ""):
+            return
+    if not _ORG_CARD_IDENTITY.is_file():
+        return
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "org_card_identity", _ORG_CARD_IDENTITY
+    )
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    reason = module.reject_title(title, body)
+    if reason:
+        raise ValueError(reason)
+
+
+def approval_owner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return _approval_owner_text(row["title"], row["body"]) if row else None
+
+
+def representative_approval_required(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(
+        row
+        and _representative_approval_required_text(row["title"], row["body"])
+    )
 
 
 def create_task(
@@ -3248,7 +3343,22 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    _reject_unidentified_org_title(
+        title.strip(),
+        triage=triage,
+        board=board,
+        conn=conn,
+        body=body,
+    )
+    declared_approval_owner = _approval_owner_text(title, body)
+    representative_hold = _representative_approval_required_text(title, body)
     representative_action_hold = _representative_action_declared(body)
+    if declared_approval_owner == "representative" or (
+        representative_hold and not declared_approval_owner
+    ):
+        assignee = "default"
+    elif declared_approval_owner:
+        assignee = declared_approval_owner
     if representative_action_hold and not assignee:
         raise ValueError(
             "a representative-action task requires an assignee result owner"
@@ -3463,7 +3573,9 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if representative_action_hold:
+                if representative_action_hold or (
+                    representative_hold and not triage
+                ):
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -3554,7 +3666,10 @@ def create_task(
                         session_id,
                     ),
                 )
-                if representative_action_hold:
+                if (
+                    (representative_hold or representative_action_hold)
+                    and task_status == "blocked"
+                ):
                     conn.execute(
                         "UPDATE tasks SET block_kind = 'needs_input', "
                         "block_recurrences = 1 WHERE id = ?",
@@ -3588,7 +3703,33 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
-                if representative_action_hold:
+                if representative_hold and task_status == "blocked":
+                    _ensure_assignee_telegram_notify_sub(
+                        conn,
+                        task_id,
+                        created_at=now,
+                        delivery_mode="notify+wake",
+                    )
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": (
+                                "대표의 명시 승인이 필요합니다. Telegram에서 "
+                                f"/kanban approve {task_id} 를 보내세요."
+                            ),
+                            "kind": "needs_input",
+                            "source_status": "created",
+                        },
+                    )
+                elif representative_action_hold and task_status == "blocked":
+                    _ensure_assignee_telegram_notify_sub(
+                        conn,
+                        task_id,
+                        created_at=now,
+                        delivery_mode="notify+wake",
+                    )
                     _append_event(
                         conn,
                         task_id,
@@ -3895,10 +4036,21 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
         if parent_status != "done":
-            conn.execute(
+            demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
+            if demoted.rowcount == 1:
+                _append_event(
+                    conn,
+                    child_id,
+                    "status",
+                    {
+                        "status": "todo",
+                        "reason": "parent_linked",
+                        "parent": parent_id,
+                    },
+                )
         _append_event(
             conn, child_id, "linked",
             {"parent": parent_id, "child": child_id},
@@ -4362,12 +4514,142 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
+    if kind in _ASSIGNEE_TELEGRAM_BRIEF_EVENT_KINDS:
+        decision_status = str((payload or {}).get("status") or "").strip()
+        if kind == "assigned":
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            decision_status = str(row["status"] or "") if row else ""
+        needs_decision = (
+            kind in _ASSIGNEE_TELEGRAM_DECISION_EVENT_KINDS
+            or decision_status in {"blocked", "review"}
+        )
+        _ensure_assignee_telegram_notify_sub(
+            conn,
+            task_id,
+            created_at=now,
+            delivery_mode="notify+wake" if needs_decision else "notify",
+        )
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+_ASSIGNEE_TELEGRAM_BRIEF_EVENT_KINDS = frozenset({
+    "assigned",
+    "blocked",
+    "block_loop_detected",
+    "changes_requested",
+    "claimed",
+    "completed",
+    "completion_blocked_approval_owner",
+    "completion_blocked_representative_approval",
+    "created",
+    "crashed",
+    "decomposed",
+    "dependency_wait",
+    "gave_up",
+    "promoted",
+    "promoted_manual",
+    "reclaimed",
+    "reconciled",
+    "review_reopened",
+    "review_requested",
+    "scheduled",
+    "specified",
+    "status",
+    "timed_out",
+    "unblocked",
+})
+
+_ASSIGNEE_TELEGRAM_DECISION_EVENT_KINDS = frozenset({
+    "blocked",
+    "block_loop_detected",
+    "completion_blocked_approval_owner",
+    "completion_blocked_representative_approval",
+    "review_requested",
+})
+
+
+def _ensure_assignee_telegram_notify_sub(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    created_at: Optional[int] = None,
+    delivery_mode: str = "notify",
+) -> bool:
+    """Route lifecycle briefings through the task assignee's Telegram bot.
+
+    Every profile bot may use the same human chat id, so the existing
+    subscription row is deliberately re-owned by ``tasks.assignee``.  The
+    assignee's gateway then selects its own Telegram credentials; the bot that
+    created the card cannot keep stealing the row merely because its chat id
+    matches.  This is best-effort and runs inside the caller's existing task
+    mutation transaction.
+    """
+    try:
+        task_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assignee = str(task_row["assignee"] or "").strip() if task_row else ""
+        if not assignee:
+            return False
+
+        from hermes_constants import get_default_hermes_root
+        import yaml
+
+        root = get_default_hermes_root()
+        config_path = (
+            root / "config.yaml"
+            if assignee == "default"
+            else root / "profiles" / assignee / "config.yaml"
+        )
+        if not config_path.is_file():
+            return False
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        telegram = ((raw.get("platforms") or {}).get("telegram") or {})
+        if telegram.get("enabled") is False:
+            return False
+        home = telegram.get("home_channel") or {}
+        chat_id = str(home.get("chat_id") or "").strip()
+        if not chat_id:
+            return False
+        thread_id = str(home.get("thread_id") or "").strip()
+        user_id = str(home.get("user_id") or "").strip() or None
+        now = int(created_at or time.time())
+
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, chat_type,
+                 notifier_profile, delivery_mode, created_at, last_event_id)
+            VALUES (?, 'telegram', ?, ?, ?, 'dm', ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+            ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET
+                user_id = COALESCE(excluded.user_id, kanban_notify_subs.user_id),
+                notifier_profile = excluded.notifier_profile,
+                delivery_mode = CASE
+                    WHEN excluded.delivery_mode = 'notify+wake'
+                      OR kanban_notify_subs.delivery_mode = 'notify+wake'
+                    THEN 'notify+wake'
+                    ELSE kanban_notify_subs.delivery_mode
+                END
+            """,
+            (
+                task_id, chat_id, thread_id, user_id, assignee,
+                delivery_mode, now, task_id,
+            ),
+        )
+        return True
+    except Exception as exc:
+        _log.debug(
+            "assignee Telegram subscription failed for %s: %s", task_id, exc,
+        )
+        return False
 
 
 def _end_run(
@@ -4556,6 +4838,28 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _blocking_parent_rows(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[sqlite3.Row]:
+    """Return parents that do not satisfy the child's dependency gate."""
+    parents = conn.execute(
+        "SELECT p.id, p.title, p.body, p.status FROM tasks p "
+        "JOIN task_links l ON l.parent_id = p.id WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    return [
+        parent
+        for parent in parents
+        if parent["status"] != "done"
+        and not (
+            parent["status"] == "archived"
+            and not _representative_approval_required_text(
+                parent["title"], parent["body"]
+            )
+        )
+    ]
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4605,13 +4909,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if not _blocking_parent_rows(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4654,13 +4952,60 @@ def recompute_ready(
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone() is None
+    return not _blocking_parent_rows(conn, task_id)
+
+
+def _park_representative_approval_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allowed_statuses: tuple[str, ...],
+    reason: str,
+) -> bool:
+    """Park a representative-only decision before any worker can claim it.
+
+    The caller owns the surrounding write transaction.
+    """
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] not in allowed_statuses
+        or not _representative_approval_required_text(row["title"], row["body"])
+    ):
+        return False
+    source_status = row["status"]
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, block_kind = 'needs_input' "
+        f"WHERE id = ? AND status IN ({','.join('?' for _ in allowed_statuses)})",
+        (task_id, *allowed_statuses),
+    )
+    if cur.rowcount != 1:
+        return False
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome="blocked",
+        status="blocked",
+        summary=reason,
+    )
+    _ensure_assignee_telegram_notify_sub(
+        conn, task_id, delivery_mode="notify+wake",
+    )
+    _append_event(
+        conn,
+        task_id,
+        "blocked",
+        {
+            "reason": reason,
+            "kind": "needs_input",
+            "source_status": source_status,
+        },
+        run_id=run_id,
+    )
+    return True
 
 
 def claim_task(
@@ -4679,6 +5024,16 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _park_representative_approval_task(
+            conn,
+            task_id,
+            allowed_statuses=("ready",),
+            reason=(
+                "대표의 명시 승인이 필요합니다. Telegram에서 "
+                f"/kanban approve {task_id} 를 보내세요."
+            ),
+        ):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4687,14 +5042,8 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
-            conn.execute(
+        if _blocking_parent_rows(conn, task_id):
+            demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
                 (task_id,),
@@ -4703,6 +5052,13 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            if demoted.rowcount == 1:
+                _append_event(
+                    conn,
+                    task_id,
+                    "status",
+                    {"status": "todo", "reason": "parents_not_done"},
+                )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4807,6 +5163,16 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _park_representative_approval_task(
+            conn,
+            task_id,
+            allowed_statuses=("review",),
+            reason=(
+                "대표의 명시 승인이 필요합니다. Telegram에서 "
+                f"/kanban approve {task_id} 를 보내세요."
+            ),
+        ):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -5399,7 +5765,11 @@ class ArtifactPreservationError(RuntimeError):
 
 
 class ApprovalOwnerRequiredError(ValueError):
-    """Raised when a profile tries to complete another owner's action."""
+    """Raised when a profile tries to complete another owner's approval."""
+
+
+class RepresentativeApprovalRequiredError(ApprovalOwnerRequiredError):
+    """Raised when an autonomous worker tries to grant representative approval."""
 
 
 def _active_approval_actor() -> str:
@@ -5425,6 +5795,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    representative_approval: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5459,16 +5830,42 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
-    task = get_task(conn, task_id)
+    owner = approval_owner(conn, task_id)
+    if owner is None and representative_approval_required(conn, task_id):
+        owner = "representative"
+    approval_required = owner == "representative"
+    task_row = conn.execute(
+        "SELECT assignee, status, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if owner and owner != "representative":
+        actor = _active_approval_actor()
+        if actor != owner or not task_row or task_row["assignee"] != owner:
+            with write_txn(conn, allow_nested=True):
+                _ensure_assignee_telegram_notify_sub(conn, task_id)
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_approval_owner",
+                    {
+                        "required_owner": owner,
+                        "attempted_by": actor,
+                        "worker_task_id": os.environ.get("HERMES_KANBAN_TASK"),
+                    },
+                )
+            raise ApprovalOwnerRequiredError(
+                f"approval belongs to {owner}; current profile {actor} cannot complete it"
+            )
     if (
-        task
-        and _representative_action_declared(task.body)
-        and task.status not in {"done", "archived"}
+        owner is None
+        and task_row
+        and _representative_action_declared(task_row["body"])
+        and task_row["status"] not in {"done", "archived"}
     ):
-        result_owner = str(task.assignee or "").strip()
+        result_owner = str(task_row["assignee"] or "").strip()
         actor = _active_approval_actor()
         if not result_owner or actor != result_owner:
             with write_txn(conn, allow_nested=True):
+                _ensure_assignee_telegram_notify_sub(conn, task_id)
                 _append_event(
                     conn,
                     task_id,
@@ -5485,6 +5882,33 @@ def complete_task(
                 f"{result_owner or 'the assigned result owner'}; current profile "
                 f"{actor} cannot complete it"
             )
+    if approval_required and not representative_approval:
+        reason = (
+            "대표의 명시 승인이 필요합니다. Telegram에서 "
+            f"/kanban approve {task_id} 를 보내세요."
+        )
+        with write_txn(conn, allow_nested=True):
+            _park_representative_approval_task(
+                conn,
+                task_id,
+                allowed_statuses=("running", "ready", "review", "todo", "scheduled"),
+                reason=reason,
+            )
+            _ensure_assignee_telegram_notify_sub(
+                conn, task_id, delivery_mode="notify+wake",
+            )
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_representative_approval",
+                {
+                    "worker_task_id": os.environ.get("HERMES_KANBAN_TASK"),
+                    "reason": reason,
+                },
+            )
+        raise RepresentativeApprovalRequiredError(
+            reason
+        )
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5542,7 +5966,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       last_failure_error = NULL,
+                       consecutive_failures = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
@@ -5559,7 +5985,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       last_failure_error = NULL,
+                       consecutive_failures = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
@@ -5620,6 +6048,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if approval_required and representative_approval:
+            completed_payload["representative_approval"] = representative_approval
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6696,7 +7126,9 @@ def request_review(
                SET status        = 'review',
                    claim_lock    = NULL,
                    claim_expires = NULL,
-                   worker_pid    = NULL
+                   worker_pid    = NULL,
+                   last_failure_error = NULL,
+                   consecutive_failures = 0
             """ + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
@@ -6893,16 +7325,7 @@ def promote_task(
         )
 
     if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
+        unsatisfied = [p["id"] for p in _blocking_parent_rows(conn, task_id)]
         if unsatisfied:
             return False, (
                 f"unsatisfied parent dependencies: "
@@ -6969,14 +7392,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
     so the two transitions can't drift.
     """
-    undone_parents = conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return "todo" if undone_parents else "ready"
+    return "todo" if _blocking_parent_rows(conn, task_id) else "ready"
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7527,7 +7943,12 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "assignee": assignee,
+                    "status": "todo",
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
@@ -7621,9 +8042,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
+    # Ordinary archived parents no longer block children. Representative
+    # approval parents are the exception: archiving means cancel, not approve,
+    # so _blocking_parent_rows keeps their descendants gated.
     recompute_ready(conn)
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
@@ -7640,11 +8061,22 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT title, body, status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if (
+            _representative_approval_required_text(row["title"], row["body"])
+            and conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        ):
+            raise RepresentativeApprovalRequiredError(
+                "cannot delete a representative approval card with dependent "
+                "tasks; keep it archived so cancellation continues to gate them"
+            )
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7668,6 +8100,21 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            row
+            and _representative_approval_required_text(row["title"], row["body"])
+            and conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        ):
+            raise RepresentativeApprovalRequiredError(
+                "cannot delete a representative approval card with dependent "
+                "tasks; archive it so cancellation continues to gate them"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8941,7 +9388,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -9185,11 +9635,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # ``_record_task_failure`` because the decision — including
                 # the per-task ``max_retries`` override — was already made
                 # against the violation streak above.
+                breaker_limit = (
+                    violation_limit
+                    if task_override is not None
+                    else max(violation_limit, int(failure_limit))
+                )
                 tripped = _record_task_failure(
                     conn, tid,
                     error=error_text,
                     outcome="crashed",
-                    failure_limit=violation_limit,
+                    failure_limit=breaker_limit,
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
@@ -9209,7 +9664,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -9324,6 +9779,13 @@ def _record_task_failure(
         else:
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
+
+        if force_trip:
+            # A caller-specific breaker (currently the protocol-violation
+            # streak) has already exhausted its own budget. Record at least
+            # that effective limit so recompute_ready cannot immediately undo
+            # the forced block using the lower unified failure count.
+            failures = max(failures, effective_limit)
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
@@ -10043,7 +10505,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.

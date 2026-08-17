@@ -163,6 +163,69 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+_KANBAN_PROCESS_WORDS = {
+    "application", "blocked", "card", "check", "delivery", "deploy", "draft",
+    "hunting", "kanban", "meeting", "pid", "pilot", "portfolio", "qa",
+    "ready", "review", "todo", "검수", "결정", "결함", "구현", "대기",
+    "등록", "메일", "반영", "발송", "배포", "복구", "사람", "삭제",
+    "제출", "준비", "지원", "실행", "시안", "안내", "요청", "원문",
+    "위시켓", "독립", "차단", "초안", "카드", "파일럿", "포트폴리오",
+    "필수", "승인",
+}
+
+
+def _title_identifies_project(title: str) -> bool:
+    import re
+    if not title:
+        return False
+    token_re = re.compile(r"[A-Za-z][A-Za-z0-9+\-]{2,}|[A-Z]{2,}\d+|[가-힣]{2,}")
+    for raw in token_re.findall(title):
+        key = raw.casefold()
+        if key in _KANBAN_PROCESS_WORDS or raw in _KANBAN_PROCESS_WORDS:
+            continue
+        if raw.isdigit():
+            continue
+        return True
+    return False
+
+
+def _find_project_name_for_task(task) -> Optional[str]:
+    import re
+    from pathlib import Path
+    
+    pid_match = None
+    if task:
+        if getattr(task, "title", None):
+            pid_match = re.search(r'\b(1\d{5})\b', task.title)
+        if not pid_match and getattr(task, "body", None):
+            pid_match = re.search(r'\b(1\d{5})\b', task.body)
+        if not pid_match and getattr(task, "idempotency_key", None):
+            pid_match = re.search(r'\b(1\d{5})\b', task.idempotency_key)
+            
+    if not pid_match:
+        return None
+        
+    pid = pid_match.group(1)
+    
+    pilots_path_str = os.environ.get("HERMES_PILOTS_DIR", "/Users/khlee/pilots")
+    pilots_dir = Path(pilots_path_str)
+    if pilots_dir.exists():
+        for p in pilots_dir.glob(f"wishket-pilot-{pid}-*"):
+            if p.is_dir():
+                slug = p.name.split(f"wishket-pilot-{pid}-", 1)[1]
+                if slug:
+                    return slug.upper()
+        opp_dir = pilots_dir / "wishket-opportunities" / "projects"
+        if opp_dir.exists():
+            for p in opp_dir.glob(f"{pid}-*"):
+                if p.is_dir():
+                    slug = p.name.split(f"{pid}-", 1)[1]
+                    if slug:
+                        return slug.upper()
+                        
+    return None
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -177,12 +240,11 @@ class GatewayKanbanWatchersMixin:
         _release_singleton_lock(handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver task lifecycle events.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
+        stored cursor for status transitions from creation through completion.
+        Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -217,7 +279,15 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = (
+            "assigned", "blocked", "block_loop_detected", "changes_requested",
+            "claimed", "completed", "completion_blocked_approval_owner",
+            "completion_blocked_representative_approval", "created", "crashed", "decomposed",
+            "dependency_wait",
+            "gave_up", "promoted", "promoted_manual", "reclaimed",
+            "reconciled", "review_reopened", "review_requested", "scheduled", "specified",
+            "status", "timed_out", "unblocked", "archived",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -507,7 +577,10 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
-                    board_tag = f"[{board_slug}] " if board_slug else ""
+                    if not _title_identifies_project(title):
+                        project_name = _find_project_name_for_task(task)
+                        if project_name:
+                            title = f"{project_name}: {title}"
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
                     # ``else`` clause) needs it even when every event in the
@@ -526,76 +599,134 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
                             # task.result for legacy rows written before
                             # runs shipped.
-                            handoff = ""
+                            result_summary = ""
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
+                                result_summary = h
                                 wake_handoff = h
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
+                                result_summary = r
                                 wake_handoff = r
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"[완료] {sub['task_id']} · {title}"
+                                f"\n결과: {result_summary or '완료 처리'}"
                             )
                         elif kind == "blocked":
-                            reason = ""
+                            reason_text = "확인 필요"
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                reason_text = str(ev.payload["reason"])
+                                wake_handoff = reason_text[:400]
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"[중단] {sub['task_id']} · {title}"
+                                f"\n원인: {reason_text[:160]}"
+                                "\n다음: 담당자가 권한 내에서 결정하거나 직속 상위에 요청"
+                            )
+                        elif kind == "gave_up":
+                            err = "반복 실행 실패"
+                            if ev.payload and ev.payload.get("error"):
+                                err = str(ev.payload["error"])[:200]
+                            msg = (
+                                f"[중단] {sub['task_id']} · {title}"
+                                f"\n원인: {err}"
+                                "\n다음: 실행 경로를 확인하고 재시도 여부 결정"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"[중단] {sub['task_id']} · {title}"
+                                "\n원인: 실행 프로세스 종료"
+                                "\n다음: 디스패처가 재시도"
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"[중단] {sub['task_id']} · {title}"
+                                f"\n원인: 실행 제한시간 {limit}초 초과"
+                                "\n다음: 디스패처가 재시도"
                             )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind in {
+                            "completion_blocked_approval_owner",
+                            "completion_blocked_representative_approval",
+                        }:
+                            reason_text = "소관 승인 책임자의 처리 필요"
+                            if ev.payload and ev.payload.get("reason"):
+                                reason_text = str(ev.payload["reason"])
+                            wake_handoff = reason_text[:400]
+                            msg = (
+                                f"[결정 필요] {sub['task_id']} · {title}"
+                                "\n상태: Blocked"
+                                f"\n원인: {reason_text[:160]}"
+                                "\n판단: 권한 내에서 승인하거나 직속 상위에 요청"
+                            )
+                        elif kind in {
+                            "assigned", "changes_requested", "claimed", "created",
+                            "decomposed", "dependency_wait", "promoted",
+                            "promoted_manual", "reclaimed", "reconciled",
+                            "review_reopened", "scheduled", "specified", "status",
+                            "unblocked",
+                        }:
+                            status_by_kind = {
+                                "claimed": "running",
+                                "decomposed": "todo",
+                                "dependency_wait": "todo",
+                                "promoted": "ready",
+                                "promoted_manual": "ready",
+                                "reconciled": "ready",
+                                "review_reopened": "ready",
+                                "scheduled": "scheduled",
+                                "specified": "todo",
+                                "unblocked": "ready",
+                            }
+                            new_status = status_by_kind.get(kind, "")
+                            if ev.payload:
+                                new_status = str(
+                                    ev.payload.get("status")
+                                    or ev.payload.get("retry_status")
+                                    or new_status
+                                )
+                            if not new_status and task:
+                                new_status = str(task.status)
+                            status_label = {
+                                "triage": "Triage",
+                                "todo": "Todo",
+                                "scheduled": "Scheduled",
+                                "ready": "Ready",
+                                "running": "In Progress",
+                                "blocked": "Blocked",
+                                "review": "Review",
+                                "done": "Done",
+                                "archived": "Archived",
+                            }.get(new_status, new_status or "Updated")
+                            msg = (
+                                f"[진행] {sub['task_id']} · {status_label} · {title}"
+                            )
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
-                            handoff = ""
+                            review_summary = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                review_summary = str(ev.payload["summary"])
+                                wake_handoff = review_summary[:400]
                             msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
+                                f"[결정 필요] {sub['task_id']} · {title}"
+                                "\n상태: Review"
+                                "\n판단: 승인, 수정 반환, 직속 상위 요청 중 선택"
                             )
+                            if review_summary:
+                                msg += f"\n근거: {review_summary[:200]}"
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -604,25 +735,22 @@ class GatewayKanbanWatchersMixin:
                             # `blocked`/`status` event — so before adding it to
                             # TERMINAL_KINDS it produced zero notification and
                             # the task stalled in triage silently. Ping loudly.
-                            reason = ""
+                            reason = "같은 원인으로 반복 중단"
                             recurrences = None
                             if ev.payload:
                                 if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                    reason = str(ev.payload["reason"])[:160]
                                 recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
+                                f"[결정 필요] {sub['task_id']} · {title}"
+                                "\n상태: Triage"
+                                f"\n원인: {reason}"
                             )
+                            if recurrences:
+                                msg += f" ({recurrences}회 반복)"
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                            # Archive is claimed so the cursor cannot wedge a
+                            # later event, but it needs no Telegram briefing.
                             continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -759,12 +887,39 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
+                        _WAKE_KINDS = (
+                            "completed", "completion_blocked_approval_owner",
+                            "completion_blocked_representative_approval", "gave_up",
+                            "crashed", "timed_out", "blocked",
                         )
+                        _wake_kinds: set[str] = set()
+                        if wake_agent:
+                            for _event in d["events"]:
+                                if _event.kind in _WAKE_KINDS:
+                                    _wake_kinds.add(_event.kind)
+                                if _event.kind == "review_requested":
+                                    _wake_kinds.add("review")
+                                if _event.kind == "block_loop_detected":
+                                    _wake_kinds.add("blocked")
+                                if _event.kind in {
+                                    "completion_blocked_approval_owner",
+                                    "completion_blocked_representative_approval",
+                                }:
+                                    _wake_kinds.add("blocked")
+                                _event_status = str(
+                                    ((_event.payload or {}).get("status") or "")
+                                )
+                                if _event_status in {"blocked", "review"}:
+                                    _wake_kinds.add(_event_status)
+                            if (
+                                task
+                                and task.status in {"blocked", "review"}
+                                and any(
+                                    _event.kind in {"assigned", "status"}
+                                    for _event in d["events"]
+                                )
+                            ):
+                                _wake_kinds.add(task.status)
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -796,6 +951,7 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review" in _wake_kinds: _parts.append("review; needs a decision")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -818,6 +974,14 @@ class GatewayKanbanWatchersMixin:
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
+                            if _wake_kinds.intersection({"blocked", "review"}):
+                                _synth += (
+                                    "\n\nDecision required: inspect the card and its evidence. "
+                                    "If the decision is within your authority, make the best "
+                                    "decision and update the board. Otherwise reuse or create a "
+                                    "linked decision request assigned to your direct manager and "
+                                    "ensure that manager is notified. Do not skip levels."
+                                )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —

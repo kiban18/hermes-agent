@@ -708,3 +708,33 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+def test_request_review_clears_failure_history(kanban_home: Path) -> None:
+    """A successful request_review transition must clear prior failure history.
+
+    Regression for #87019: a task that failed, then was fixed and moved to
+    review, kept its stale last_failure_error stamp — which the dispatcher's
+    blocker_auth guard saw on the NEXT tick, blocking the review run from
+    ever starting.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="clear history", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = ?, last_failure_error = ? WHERE id = ?",
+            (3, "API quota exhausted", tid),
+        )
+        conn.commit()
+
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 3
+        assert task.last_failure_error == "API quota exhausted"
+
+        ok = kb.request_review(conn, tid, summary="fixed and ready for review")
+        assert ok is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+

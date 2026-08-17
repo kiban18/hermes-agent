@@ -151,62 +151,6 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
-def test_representative_action_is_a_sticky_human_gate_owned_by_assignee(
-    kanban_home, monkeypatch,
-):
-    with kb.connect() as conn:
-        task_id = kb.create_task(
-            conn,
-            title="send the prepared client message",
-            body="완료 기준: 발송 로그\n사람 실행자: 대표",
-            assignee="project_lead",
-        )
-
-        task = kb.get_task(conn, task_id)
-        assert task.status == "blocked"
-        assert task.block_kind == "needs_input"
-        assert task.assignee == "project_lead"
-        assert kb.representative_action_required(task) is True
-        assert kb.recompute_ready(conn) == 0
-
-        blocked = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"]
-        assert blocked[-1].payload["representative_action"] is True
-        assert "실제 실행" in blocked[-1].payload["reason"]
-
-        context = kb.build_worker_context(conn, task_id)
-        assert "Representative action: pending" in context
-        assert "do not perform the human action" in context
-        assert "/kanban approve" in context
-
-        monkeypatch.setenv("HERMES_PROFILE", "executive_coordinator")
-        with pytest.raises(kb.ApprovalOwnerRequiredError):
-            kb.complete_task(conn, task_id, summary="representative acted")
-
-        monkeypatch.setenv("HERMES_PROFILE", "project_lead")
-        assert kb.complete_task(
-            conn,
-            task_id,
-            summary="representative action evidence verified",
-        ) is True
-        assert kb.representative_action_required(kb.get_task(conn, task_id)) is False
-
-        with pytest.raises(ValueError, match="requires an assignee result owner"):
-            kb.create_task(
-                conn,
-                title="ownerless human action",
-                body="사람 실행자: 대표",
-            )
-
-        triage_id = kb.create_task(
-            conn,
-            title="human action cannot remain in triage",
-            body="사람 실행자: 대표",
-            assignee="ops_admin",
-            triage=True,
-        )
-        assert kb.get_task(conn, triage_id).status == "blocked"
-
-
 def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
@@ -1335,7 +1279,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
 
 
-def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+def _drive_worker_exit(
+    conn, tid, fake_pid, raw_status, *, failure_limit=kb.DEFAULT_FAILURE_LIMIT,
+):
     """Claim ``tid``, record ``raw_status`` for its dead worker pid, and run
     one reaper pass.
 
@@ -1355,17 +1301,18 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
-        return _kb.detect_crashed_workers(conn)
+        return _kb.detect_crashed_workers(conn, failure_limit=failure_limit)
     finally:
         _kb._pid_alive = original_alive
 
 
-def _drive_protocol_violation(conn, tid, fake_pid):
+def _drive_protocol_violation(conn, tid, fake_pid, *, failure_limit=None):
     """One clean-exit protocol violation reaper pass for ``tid``.
 
     os.W_EXITCODE(status=0, signal=0) == 0 on POSIX.
     """
-    return _drive_worker_exit(conn, tid, fake_pid, 0)
+    kwargs = {} if failure_limit is None else {"failure_limit": failure_limit}
+    return _drive_worker_exit(conn, tid, fake_pid, 0, **kwargs)
 
 
 def _drive_nonzero_crash(conn, tid, fake_pid):
@@ -1424,6 +1371,190 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         conn.close()
 
 
+def test_protocol_violation_forced_trip_survives_recompute_ready(kanban_home):
+    """A violation-only breaker trip stays blocked until explicit unblock."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="protocol-only", assignee="worker")
+        for pid in (992001, 992002, 992003):
+            _drive_protocol_violation(conn, tid, pid)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures >= _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_protocol_violation_forced_trip_honors_dispatcher_limit(kanban_home):
+    """A custom dispatcher threshold cannot reopen a protocol trip."""
+    import hermes_cli.kanban_db as _kb
+
+    failure_limit = _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT + 2
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="custom-limit", assignee="worker")
+        for pid in (993001, 993002, 993003):
+            _drive_protocol_violation(
+                conn, tid, pid, failure_limit=failure_limit,
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures >= failure_limit
+        assert kb.recompute_ready(conn, failure_limit=failure_limit) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_representative_action_is_a_sticky_human_gate_owned_by_assignee(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="send the prepared client message",
+            body="완료 기준: 발송 로그\n사람 실행자: 대표",
+            assignee="project_lead",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.assignee == "project_lead"
+        assert kb.representative_action_required(task) is True
+        assert kb.representative_approval_required(conn, task_id) is False
+        assert kb.recompute_ready(conn) == 0
+
+        blocked = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"]
+        assert blocked[-1].payload["representative_action"] is True
+        assert "실제 실행" in blocked[-1].payload["reason"]
+
+        context = kb.build_worker_context(conn, task_id)
+        assert "Representative action: pending" in context
+        assert "do not perform the human action" in context
+        assert "/kanban approve" in context
+
+        monkeypatch.setenv("HERMES_PROFILE", "executive_coordinator")
+        with pytest.raises(kb.ApprovalOwnerRequiredError):
+            kb.complete_task(conn, task_id, summary="representative acted")
+
+        monkeypatch.setenv("HERMES_PROFILE", "project_lead")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="representative action evidence verified",
+        ) is True
+        assert kb.representative_action_required(kb.get_task(conn, task_id)) is False
+
+        with pytest.raises(ValueError, match="requires an assignee result owner"):
+            kb.create_task(
+                conn,
+                title="ownerless human action",
+                body="사람 실행자: 대표",
+            )
+
+        triage_id = kb.create_task(
+            conn,
+            title="human action cannot remain in triage",
+            body="사람 실행자: 대표",
+            assignee="ops_admin",
+            triage=True,
+        )
+        assert kb.get_task(conn, triage_id).status == "blocked"
+
+
+def test_manager_approval_is_not_treated_as_representative_approval(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        manager_tid = kb.create_task(
+            conn,
+            title="commit push deploy approval",
+            body="승인 필요: 예\n승인 주체: project-manager",
+            assignee="project-manager",
+        )
+        representative_tid = kb.create_task(
+            conn,
+            title="representative-only approval",
+            body="대표 승인 필요: 예",
+            assignee="default",
+        )
+        child_tid = kb.create_task(
+            conn,
+            title="external action",
+            assignee="default",
+            parents=[representative_tid],
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv("HERMES_PROFILE", "project-manager")
+
+        assert kb.complete_task(conn, manager_tid, summary="manager-approved") is True
+
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        with pytest.raises(kb.RepresentativeApprovalRequiredError):
+            kb.complete_task(conn, representative_tid, summary="I approve myself")
+
+        assert kb.get_task(conn, representative_tid).status == "blocked"
+        assert kb.get_task(conn, child_tid).status == "todo"
+        assert any(
+            event.kind == "completion_blocked_representative_approval"
+            for event in kb.list_events(conn, representative_tid)
+        )
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        with pytest.raises(kb.RepresentativeApprovalRequiredError):
+            kb.complete_task(conn, representative_tid, summary="assistant-approved")
+
+        assert kb.complete_task(
+            conn,
+            representative_tid,
+            summary="representative approved in Telegram",
+            representative_approval="telegram:m1",
+        ) is True
+        assert kb.get_task(conn, child_tid).status == "ready"
+
+
+def test_approval_owner_cannot_be_bypassed_by_another_profile(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="deployment approval",
+            body="승인 필요: 예\n승인 주체: project-manager",
+            assignee="default",
+        )
+        assert kb.get_task(conn, task_id).assignee == "project-manager"
+
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        with pytest.raises(kb.ApprovalOwnerRequiredError):
+            kb.complete_task(conn, task_id, summary="secretary guessed approval")
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        monkeypatch.setenv("HERMES_PROFILE", "project-manager")
+        assert kb.complete_task(conn, task_id, summary="manager approved")
+
+
+def test_archived_representative_approval_does_not_release_or_delete_children(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        approval = kb.create_task(
+            conn,
+            title="representative approval",
+            body="승인 주체: 대표",
+            assignee="default",
+        )
+        child = kb.create_task(conn, title="external action", parents=[approval])
+
+        assert kb.archive_task(conn, approval)
+        assert kb.get_task(conn, child).status == "todo"
+        with pytest.raises(kb.RepresentativeApprovalRequiredError):
+            kb.delete_archived_task(conn, approval)
+        assert kb.get_task(conn, approval) is not None
+
+
 
 
 
@@ -1462,4 +1593,32 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
+
+
+def test_complete_task_clears_failure_history(kanban_home: Path) -> None:
+    """A successful complete_task transition must clear prior failure history.
+
+    Same pattern as request_review's guard, but for `complete`. A task that
+    failed, was fixed, and then completed must not retain its stale failure
+    stamp.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="clear history on complete", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', consecutive_failures = ?, last_failure_error = ? WHERE id = ?",
+            (2, "Something broke", tid),
+        )
+        conn.commit()
+
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 2
+        assert task.last_failure_error == "Something broke"
+
+        ok = kb.complete_task(conn, tid, summary="all fixed")
+        assert ok is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
 

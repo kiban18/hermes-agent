@@ -66,6 +66,187 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def test_assignee_telegram_bot_receives_each_task_state(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_dir = root / "profiles" / "worker"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        """platforms:
+  telegram:
+    enabled: true
+    home_channel:
+      platform: telegram
+      chat_id: chat-1
+      user_id: user-1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "states.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="state briefing", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting for evidence")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="verified result")
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["notifier_profile"] == "worker"
+        assert sub["chat_id"] == "chat-1"
+        assert sub["delivery_mode"] == "notify+wake"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "worker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    messages = [item["text"] for item in adapter.sent]
+    assert sum(text.startswith("[진행]") and "Ready" in text for text in messages) == 2
+    assert sum(text.startswith("[진행]") and "In Progress" in text for text in messages) == 2
+    assert any(
+        text.startswith("[중단]") and "원인: waiting for evidence" in text
+        for text in messages
+    )
+    assert any(
+        text.startswith("[완료]") and "결과: verified result" in text
+        for text in messages
+    )
+    assert all("Kanban" not in text and "@worker" not in text for text in messages)
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "worker"
+    assert "within your authority" in adapter.handled[0].text
+    assert "direct manager" in adapter.handled[0].text
+
+
+def test_review_wakes_assigned_reviewer_to_decide_or_escalate(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_dir = root / "profiles" / "reviewer"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        """platforms:
+  telegram:
+    enabled: true
+    home_channel:
+      platform: telegram
+      chat_id: review-chat
+      user_id: review-user
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review decision", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            reviewer="reviewer",
+            summary="check the release evidence",
+            expected_run_id=claimed.current_run_id,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["notifier_profile"] == "reviewer"
+        assert sub["delivery_mode"] == "notify+wake"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert any(
+        item["text"].startswith("[결정 필요]")
+        and "상태: Review" in item["text"]
+        and "판단: 승인, 수정 반환, 직속 상위 요청 중 선택" in item["text"]
+        for item in adapter.sent
+    )
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "reviewer"
+    assert "within your authority" in adapter.handled[0].text
+    assert "direct manager" in adapter.handled[0].text
+
+
+def test_completion_approval_block_requests_a_decision(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "approval.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="approval decision", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                tid,
+                "completion_blocked_approval_owner",
+                {"required_owner": "delivery-owner", "attempted_by": "worker"},
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert any(
+        item["text"].startswith("[결정 필요]")
+        and "상태: Blocked" in item["text"]
+        and "원인: 소관 승인 책임자의 처리 필요" in item["text"]
+        for item in adapter.sent
+    )
+
+
+def test_assignee_telegram_bot_receives_parent_link_demotion(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_dir = root / "profiles" / "worker"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        """platforms:
+  telegram:
+    enabled: true
+    home_channel:
+      platform: telegram
+      chat_id: chat-1
+      user_id: user-1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "link.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="unfinished parent", assignee="worker")
+        child_id = kb.create_task(conn, title="demoted child", assignee="worker")
+        kb.link_tasks(conn, parent_id, child_id)
+        assert kb.get_task(conn, child_id).status == "todo"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "worker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    child_messages = [
+        item["text"] for item in adapter.sent if child_id in item["text"]
+    ]
+    assert any(text.startswith("[진행]") and "Ready" in text for text in child_messages)
+    assert any(text.startswith("[진행]") and "Todo" in text for text in child_messages)
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
@@ -165,7 +346,8 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
     assert tid in message
-    assert "blocked" in message
+    assert message.startswith("[중단]")
+    assert f"원인: {reason}" in message
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -323,7 +505,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     # First crash delivered.
     assert len(adapter.sent) == 1
-    assert "crashed" in adapter.sent[0]["text"].lower()
+    assert adapter.sent[0]["text"].startswith("[중단]")
+    assert "원인: 실행 프로세스 종료" in adapter.sent[0]["text"]
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -351,7 +534,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "crashed" in adapter.sent[1]["text"].lower()
+    assert adapter.sent[1]["text"].startswith("[중단]")
+    assert "원인: 실행 프로세스 종료" in adapter.sent[1]["text"]
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(
@@ -609,7 +793,8 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
     text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
+    assert text.startswith("[결정 필요]")
+    assert "상태: Triage" in text
     assert tid in text
     assert "needs credentials" in text
     # Cursor advanced: the event is claimed and not re-delivered.
@@ -622,3 +807,42 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_prepends_project_name_when_title_generic(tmp_path, monkeypatch):
+    """The notifier automatically prepends the project name if the card title is generic."""
+    db_path = tmp_path / "generic-title.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="hunting 157680 — 파일럿·검수·포트폴리오·지원 준비",
+            assignee="worker",
+            body="위시켓 PID 157680 WordPress 예술심리 LMS의...",
+            idempotency_key="proposal-lifecycle:wishket:157680",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="verified result")
+    finally:
+        conn.close()
+
+    # Set up mock pilots dir with the expected project name structure
+    pilots_dir = tmp_path / "pilots"
+    pilots_dir.mkdir()
+    pilot_project_dir = pilots_dir / "wishket-pilot-157680-artehill"
+    pilot_project_dir.mkdir()
+
+    monkeypatch.setenv("HERMES_PILOTS_DIR", str(pilots_dir))
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "ARTEHILL" in text
+    assert text.startswith("[완료]")
+    assert "ARTEHILL: hunting 157680 — 파일럿·검수·포트폴리오·지원 준비" in text
