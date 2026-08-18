@@ -464,7 +464,20 @@ def _merge_board_payloads(payloads: list[dict[str, Any]], *, sort: str) -> dict[
                 column_order.append(name)
                 tasks_by_col[name] = []
             tasks_by_col[name].extend(col.get("tasks") or [])
-    if sort != "status_changed":
+    if sort == "status_changed":
+        # Each payload is sorted within its own board, so concatenating them
+        # leaves the merged column grouped by board instead of ordered by
+        # recency. Re-sort globally on the key get_board carried over.
+        for name, tasks in tasks_by_col.items():
+            tasks.sort(
+                key=lambda task: (
+                    task.get("status_changed_at") or 0,
+                    task.get("created_at") or 0,
+                    task.get("id") or "",
+                ),
+                reverse=True,
+            )
+    else:
         for name, tasks in tasks_by_col.items():
             tasks.sort(
                 key=lambda task: (
@@ -542,6 +555,7 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
+        latest_changes: dict[str, tuple[int, int]] = {}
         if sort == "status_changed" and tasks:
             task_ids = [t.id for t in tasks]
             task_placeholders = ",".join(["?"] * len(task_ids))
@@ -644,6 +658,12 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            if sort == "status_changed":
+                # The all-boards view merges these payloads and cannot re-derive
+                # the sort key without the events table, so ship it with the card.
+                d["status_changed_at"] = latest_changes.get(
+                    t.id, (t.completed_at or t.created_at, 0),
+                )[0]
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render

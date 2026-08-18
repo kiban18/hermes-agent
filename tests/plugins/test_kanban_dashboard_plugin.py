@@ -299,6 +299,53 @@ def test_board_sorts_by_latest_status_change_not_latest_activity(client, monkeyp
     ]
 
 
+def test_all_boards_view_sorts_by_status_change_across_boards(client, monkeypatch):
+    """Merged multi-board columns must order by recency, not group by board.
+
+    Each board's payload arrives already sorted, so concatenating them left
+    the newest card stranded behind every card of an earlier board.
+    """
+    kb.create_board("alpha")
+    kb.create_board("beta")
+
+    monkeypatch.setattr(time, "time", lambda: 100)
+    older = client.post(
+        "/api/plugins/kanban/tasks?board=alpha",
+        json={"title": "alpha older", "priority": 9},
+    ).json()["task"]
+    monkeypatch.setattr(time, "time", lambda: 200)
+    newer = client.post(
+        "/api/plugins/kanban/tasks?board=beta",
+        json={"title": "beta newer", "priority": 1},
+    ).json()["task"]
+
+    monkeypatch.setattr(time, "time", lambda: 300)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{older['id']}?board=alpha",
+        json={"status": "blocked", "block_reason": "wait"},
+    ).status_code == 200
+    monkeypatch.setattr(time, "time", lambda: 400)
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{newer['id']}?board=beta",
+        json={"status": "blocked", "block_reason": "wait"},
+    ).status_code == 200
+
+    merged = client.get(
+        "/api/plugins/kanban/board?board=*&sort=status_changed"
+    ).json()
+    blocked = next(c["tasks"] for c in merged["columns"] if c["name"] == "blocked")
+    assert [task["id"] for task in blocked] == [newer["id"], older["id"]]
+
+    # Priority order stays board-agnostic too (regression guard on the else arm).
+    merged_priority = client.get(
+        "/api/plugins/kanban/board?board=*"
+    ).json()
+    blocked_priority = next(
+        c["tasks"] for c in merged_priority["columns"] if c["name"] == "blocked"
+    )
+    assert [task["id"] for task in blocked_priority] == [older["id"], newer["id"]]
+
+
 def test_dashboard_markdown_html_is_sanitized_before_render():
     """Markdown rendering must sanitize HTML before dangerouslySetInnerHTML."""
 
