@@ -141,3 +141,15 @@ def test_dashboard_bundle_has_all_boards_switcher():
     assert "function isAllBoards(slug)" in js
     assert "hermes-kanban-board-slug" in js
     assert "t.board_slug" in js
+
+
+def test_dashboard_card_chips_use_readable_ui_font():
+    """P100 / tenant / board chips must not keep Rules Compressed tracking."""
+    repo_root = Path(__file__).resolve().parents[2]
+    css = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    ).read_text()
+    assert ".hermes-kanban-priority" in css
+    assert ".hermes-kanban-tag" in css
+    assert "font-family: var(--theme-font-sans" in css
+    assert "letter-spacing: 0.03em" in css

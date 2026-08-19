@@ -280,22 +280,28 @@
   gap: 0.55rem;
 }
 
+/* Nous Badge defaults to Rules Compressed + 0.2em tracking. At 10px that
+   makes P100 / PROPOSAL (and other card chips) nearly unreadable. Force a
+   UI sans stack and tighten tracking so the label stays a chip, not art. */
+.hermes-kanban-priority,
+.hermes-kanban-tag,
+.hermes-kanban-needs-assignee {
+  font-family: var(--theme-font-sans, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif) !important;
+  font-size: 0.72rem !important;
+  font-weight: 600;
+  letter-spacing: 0.03em !important;
+  line-height: 1.2;
+  padding: 0.12rem 0.38rem !important;
+}
+
 .hermes-kanban-priority {
-  font-size: 0.6rem !important;
-  padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-ring) 18%, transparent);
   color: var(--color-foreground);
   border: 1px solid color-mix(in srgb, var(--color-ring) 40%, transparent);
 }
 
-.hermes-kanban-tag {
-  font-size: 0.6rem !important;
-  padding: 0.05rem 0.3rem !important;
-}
-
 .hermes-kanban-needs-assignee {
-  font-size: 0.6rem !important;
-  padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-warning, #d4b348) 16%, transparent);
   border-color: color-mix(in srgb, var(--color-warning, #d4b348) 45%, var(--color-border));
   color: var(--color-foreground);
