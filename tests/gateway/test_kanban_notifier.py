@@ -7,6 +7,7 @@ from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
     _release_singleton_lock,
+    human_timeout_reason,
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -106,8 +107,8 @@ def test_assignee_telegram_bot_receives_each_task_state(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     messages = [item["text"] for item in adapter.sent]
-    assert sum(text.startswith("[진행]") and "Ready" in text for text in messages) == 2
-    assert sum(text.startswith("[진행]") and "In Progress" in text for text in messages) == 2
+    assert sum(text.startswith("[진행]") and "Ready" in text for text in messages) == 0
+    assert sum(text.startswith("[진행]") and "In Progress" in text for text in messages) == 0
     assert any(
         text.startswith("[중단]") and "원인: waiting for evidence" in text
         for text in messages
@@ -243,8 +244,12 @@ def test_assignee_telegram_bot_receives_parent_link_demotion(tmp_path, monkeypat
     child_messages = [
         item["text"] for item in adapter.sent if child_id in item["text"]
     ]
-    assert any(text.startswith("[진행]") and "Ready" in text for text in child_messages)
-    assert any(text.startswith("[진행]") and "Todo" in text for text in child_messages)
+    assert not any(
+        text.startswith("[진행]") and "Ready" in text for text in child_messages
+    )
+    assert not any(
+        text.startswith("[진행]") and "Todo" in text for text in child_messages
+    )
 
 
 def _unseen_terminal_events(tid):
@@ -610,9 +615,9 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # The reopen status and second completion each deliver once, while only
-    # completion wakes the exact original session/thread.
-    assert len(adapter.sent) == 3
+    # Ready [진행] is suppressed; only the second completion delivers.
+    # Completion still wakes the exact original session/thread.
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
@@ -633,7 +638,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     conn = kb.connect()
     try:
@@ -846,3 +851,23 @@ def test_notifier_prepends_project_name_when_title_generic(tmp_path, monkeypatch
     assert "ARTEHILL" in text
     assert text.startswith("[완료]")
     assert "ARTEHILL: hunting 157680 — 파일럿·검수·포트폴리오·지원 준비" in text
+
+
+def test_human_timeout_reason_prefers_iteration_budget():
+    cause, nxt = human_timeout_reason({"budget_used": 30, "budget_max": 30})
+    assert cause == "한 번에 할 수 있는 단계(30/30)를 다 써서 멈춤"
+    assert nxt == "같은 일을 이어서 다시 시도"
+
+
+def test_human_timeout_reason_does_not_invent_zero_seconds():
+    cause, nxt = human_timeout_reason({})
+    assert "0초" not in cause
+    assert cause == "실행이 중간에 끊김"
+    assert nxt == "같은 일을 이어서 다시 시도"
+
+
+def test_human_timeout_reason_uses_real_runtime_limit():
+    cause, _nxt = human_timeout_reason(
+        {"elapsed_seconds": 610, "limit_seconds": 600}
+    )
+    assert cause == "실행 시간 610초가 제한 600초를 넘김"

@@ -24,6 +24,77 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Progress-template kinds that used to emit "[진행] Todo/Ready/…".
+# Humans only need [중단], [결정 필요], [완료], and 👤 Human cards.
+_PROGRESS_EVENT_KINDS = frozenset({
+    "assigned", "changes_requested", "claimed", "created",
+    "decomposed", "dependency_wait", "promoted",
+    "promoted_manual", "reclaimed", "reconciled",
+    "review_reopened", "scheduled", "specified", "status",
+    "unblocked",
+})
+_PROGRESS_NOTIFY_SKIP_STATUSES = frozenset({
+    "todo", "ready", "running", "scheduled",
+})
+
+
+def should_skip_progress_notify(
+    *,
+    kind: str,
+    status: str,
+    title: str = "",
+) -> bool:
+    """Return True when a [진행] template must not be sent.
+
+    Todo / Ready / In Progress / Scheduled are noisy state ticks.
+    Representative-action cards (👤 in the title) still notify.
+    """
+    if kind not in _PROGRESS_EVENT_KINDS:
+        return False
+    if "👤" in (title or ""):
+        return False
+    return status in _PROGRESS_NOTIFY_SKIP_STATUSES
+
+
+def human_timeout_reason(payload: Any) -> tuple[str, str]:
+    """Return a short human cause and next-step line for timed_out events."""
+    data = payload if isinstance(payload, dict) else {}
+    used = data.get("budget_used")
+    maximum = data.get("budget_max")
+    if used is not None and maximum is not None:
+        return (
+            f"한 번에 할 수 있는 단계({used}/{maximum})를 다 써서 멈춤",
+            "같은 일을 이어서 다시 시도",
+        )
+    raw_limit = data.get("limit_seconds")
+    try:
+        limit = int(raw_limit) if raw_limit is not None else 0
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        try:
+            elapsed = int(data.get("elapsed_seconds") or 0)
+        except (TypeError, ValueError):
+            elapsed = 0
+        if elapsed > 0:
+            return (
+                f"실행 시간 {elapsed}초가 제한 {limit}초를 넘김",
+                "같은 일을 이어서 다시 시도",
+            )
+        return (
+            f"실행 시간 제한 {limit}초를 넘김",
+            "같은 일을 이어서 다시 시도",
+        )
+    error = str(data.get("error") or "").strip()
+    if "iteration" in error.casefold() or "budget" in error.casefold():
+        return (
+            "한 번에 할 수 있는 단계를 다 써서 멈춤",
+            "같은 일을 이어서 다시 시도",
+        )
+    if error:
+        return (error[:160], "같은 일을 이어서 다시 시도")
+    return ("실행이 중간에 끊김", "같은 일을 이어서 다시 시도")
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -649,13 +720,11 @@ class GatewayKanbanWatchersMixin:
                                 "\n다음: 디스패처가 재시도"
                             )
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
+                            cause, nxt = human_timeout_reason(ev.payload)
                             msg = (
                                 f"[중단] {sub['task_id']} · {title}"
-                                f"\n원인: 실행 제한시간 {limit}초 초과"
-                                "\n다음: 디스패처가 재시도"
+                                f"\n원인: {cause}"
+                                f"\n다음: {nxt}"
                             )
                         elif kind in {
                             "completion_blocked_approval_owner",
@@ -699,6 +768,12 @@ class GatewayKanbanWatchersMixin:
                                 )
                             if not new_status and task:
                                 new_status = str(task.status)
+                            if should_skip_progress_notify(
+                                kind=kind,
+                                status=new_status,
+                                title=title,
+                            ):
+                                continue
                             status_label = {
                                 "triage": "Triage",
                                 "todo": "Todo",
@@ -1801,6 +1876,20 @@ class GatewayKanbanWatchersMixin:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        try:
+                            with _kb.connect_closing(board=slug) as _peek:
+                                _task = _kb.get_task(_peek, tid)
+                            if _task is not None and _decomp.is_workspace_detection_title(
+                                _task.title
+                            ):
+                                logger.debug(
+                                    "kanban auto-decompose [%s]: %s skipped: "
+                                    "workspace detection card",
+                                    slug, tid,
+                                )
+                                continue
+                        except Exception:
+                            pass
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(

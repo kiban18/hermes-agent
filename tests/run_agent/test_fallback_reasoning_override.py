@@ -132,3 +132,63 @@ class TestFallbackReasoningOverride:
 
         assert result is not None
         assert result.get("enabled") is False
+
+    def test_fallback_refresh_honours_cron_none_pin(self):
+        """try_activate_fallback must not replace a cron monitor pin.
+
+        Production path: resolve_switched_model_reasoning_config(..., pin=).
+        A monitor job with reasoning_effort=none that 429s onto Grok must
+        stay thinking-off.
+        """
+        from types import SimpleNamespace
+
+        from hermes_constants import (
+            reasoning_pin_from_agent,
+            resolve_switched_model_reasoning_config,
+        )
+
+        agent = SimpleNamespace(
+            platform="cron",
+            model="grok-4.6",
+            reasoning_config={"enabled": False},
+            _reasoning_pin={"enabled": False},
+        )
+        cfg = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"grok-4.6": "high"},
+            }
+        }
+        pin = reasoning_pin_from_agent(agent)
+        assert pin == {"enabled": False}
+        agent.reasoning_config = resolve_switched_model_reasoning_config(
+            cfg, agent.model, pin=pin
+        )
+        assert agent.reasoning_config == {"enabled": False}
+
+    def test_interactive_switch_still_applies_higher_override(self):
+        """Without a pin, /model switch may raise thinking for the new model."""
+        from types import SimpleNamespace
+
+        from hermes_constants import (
+            reasoning_pin_from_agent,
+            resolve_switched_model_reasoning_config,
+        )
+
+        agent = SimpleNamespace(
+            platform="cli",
+            model="claude-opus-4.5",
+            reasoning_config={"enabled": True, "effort": "medium"},
+            _reasoning_pin=None,
+        )
+        cfg = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"claude-opus-4.5": "xhigh"},
+            }
+        }
+        assert reasoning_pin_from_agent(agent) is None
+        agent.reasoning_config = resolve_switched_model_reasoning_config(
+            cfg, agent.model, pin=reasoning_pin_from_agent(agent)
+        )
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}

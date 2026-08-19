@@ -46,6 +46,13 @@ from typing import Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
 
+WORKSPACE_DETECTION_TITLE_PREFIX = "외부 작업 감지"
+
+
+def is_workspace_detection_title(title: str | None) -> bool:
+    """Detection cards stay as a single triage — never a work graph."""
+    return WORKSPACE_DETECTION_TITLE_PREFIX in str(title or "")
+
 logger = logging.getLogger(__name__)
 
 
@@ -288,6 +295,12 @@ def decompose_task(
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if is_workspace_detection_title(task.title):
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "workspace detection cards are not decomposed or reassigned",
         )
 
     cfg = _load_config()

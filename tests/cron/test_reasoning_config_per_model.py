@@ -87,3 +87,116 @@ class TestCronPerModelReasoningConfig:
         )
         assert result is not None
         assert result.get("enabled") is False
+
+
+class TestCronFleetReasoningOverride:
+    def test_cron_fleet_low_beats_agent_medium(self):
+        from hermes_constants import resolve_cron_reasoning_config
+
+        cfg = {
+            "agent": {"reasoning_effort": "medium"},
+            "cron": {"reasoning_effort": "low"},
+        }
+        result = resolve_cron_reasoning_config(cfg, "gpt-5", {})
+        assert result == {"enabled": True, "effort": "low"}
+
+    def test_monitor_job_defaults_to_thinking_off(self):
+        from hermes_constants import resolve_cron_reasoning_config
+
+        cfg = {
+            "agent": {"reasoning_effort": "medium"},
+            "cron": {"reasoning_effort": "low"},
+        }
+        result = resolve_cron_reasoning_config(
+            cfg, "gpt-5", {"monitor_script": "workspace-delivery-monitor.sh"}
+        )
+        assert result == {"enabled": False}
+
+    def test_job_pin_wins_over_monitor_default(self):
+        from hermes_constants import resolve_cron_reasoning_config
+
+        cfg = {"agent": {"reasoning_effort": "medium"}, "cron": {"reasoning_effort": "low"}}
+        result = resolve_cron_reasoning_config(
+            cfg,
+            "gpt-5",
+            {"monitor_script": "x.sh", "reasoning_effort": "low"},
+        )
+        assert result == {"enabled": True, "effort": "low"}
+
+    def test_empty_cron_key_falls_through_to_agent(self):
+        from hermes_constants import resolve_cron_reasoning_config
+
+        cfg = {"agent": {"reasoning_effort": "high"}, "cron": {"reasoning_effort": ""}}
+        result = resolve_cron_reasoning_config(cfg, "gpt-5", {})
+        assert result == {"enabled": True, "effort": "high"}
+
+    def test_fallback_model_keeps_monitor_none_pin(self):
+        """A monitor job pinned to none stays off after a fallback swap."""
+        from hermes_constants import (
+            resolve_cron_reasoning_config,
+            resolve_switched_model_reasoning_config,
+        )
+
+        cfg = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {
+                    "grok-4.6": "high",
+                    "gemini-3.5-flash": "low",
+                },
+            },
+            "cron": {"reasoning_effort": "low"},
+        }
+        pin = resolve_cron_reasoning_config(
+            cfg,
+            "gemini-3.5-flash",
+            {
+                "monitor_script": "workspace-delivery-monitor.sh",
+                "reasoning_effort": "none",
+            },
+        )
+        assert pin == {"enabled": False}
+        swapped = resolve_switched_model_reasoning_config(
+            cfg, "grok-4.6", pin=pin
+        )
+        assert swapped == {"enabled": False}
+
+    def test_fallback_may_lower_but_not_raise_pin(self):
+        from hermes_constants import resolve_switched_model_reasoning_config
+
+        pin = {"enabled": True, "effort": "low"}
+        raised = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"gpt-5": "high"},
+            }
+        }
+        lowered = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"gpt-5": "none"},
+            }
+        }
+        assert resolve_switched_model_reasoning_config(
+            raised, "gpt-5", pin=pin
+        ) == pin
+        assert resolve_switched_model_reasoning_config(
+            lowered, "gpt-5", pin=pin
+        ) == {"enabled": False}
+
+
+class TestNormalizeJobReasoningEffort:
+    def test_none_and_false(self):
+        from cron.jobs import _normalize_job_reasoning_effort
+
+        assert _normalize_job_reasoning_effort(None) is None
+        assert _normalize_job_reasoning_effort("") is None
+        assert _normalize_job_reasoning_effort(False) == "none"
+        assert _normalize_job_reasoning_effort("none") == "none"
+        assert _normalize_job_reasoning_effort("low") == "low"
+
+    def test_unknown_raises(self):
+        from cron.jobs import _normalize_job_reasoning_effort
+
+        with pytest.raises(ValueError, match="invalid reasoning_effort"):
+            _normalize_job_reasoning_effort("hyperthink")

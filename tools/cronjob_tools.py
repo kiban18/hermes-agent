@@ -697,6 +697,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
         result["monitor_url"] = job["monitor_url"]
+    if job.get("reasoning_effort"):
+        result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
     if job.get("no_agent"):
@@ -1589,6 +1591,10 @@ def cronjob(
                 updates["monitor_url"] = (
                     _normalize_optional_job_value(monitor_url) if monitor_url else None
                 )
+            if reasoning_effort is not None:
+                updates["reasoning_effort"] = (
+                    None if str(reasoning_effort).strip() == "" else reasoning_effort
+                )
             if monitor_script is not None or monitor_url is not None:
                 eff_mon_script = (
                     updates["monitor_script"] if "monitor_script" in updates else job.get("monitor_script")
@@ -1746,6 +1752,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "string",
                 "description": "Optional http(s) URL used as the monitor source instead of a script — fetched with a bounded GET (30s timeout, 256KB cap) each tick. Same hash-suppression semantics as monitor_script. Mutually exclusive with monitor_script. On update, pass empty string to clear."
             },
+            "reasoning_effort": {
+                "type": "string",
+                "description": "Optional thinking pin for this job (none|minimal|low|medium|high|xhigh|max|ultra). Overrides cron.reasoning_effort. Monitor jobs already default to none when this is unset. On update, pass empty string to inherit the fleet default again."
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -1863,6 +1873,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        reasoning_effort=args.get("reasoning_effort"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

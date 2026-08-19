@@ -2952,13 +2952,21 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # The new model may have a different reasoning_effort override. Re-read
     # config so the override takes effect immediately on /model switch —
     # resolved through the shared chokepoint (per-model > global; YAML
-    # boolean False = disabled).
+    # boolean False = disabled). Cron/job pins stay put unless the
+    # override is strictly lower.
     try:
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import (
+            reasoning_pin_from_agent,
+            resolve_switched_model_reasoning_config,
+        )
         from hermes_cli.config import load_config as _sm_load_config
 
         _reasoning_cfg = _sm_load_config() or {}
-        agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
+        agent.reasoning_config = resolve_switched_model_reasoning_config(
+            _reasoning_cfg,
+            agent.model,
+            pin=reasoning_pin_from_agent(agent),
+        )
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s",
             agent.model, agent.reasoning_config,

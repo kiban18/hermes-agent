@@ -145,6 +145,27 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decompose_skips_workspace_detection_card(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="나라장터 — 외부 작업 감지",
+            triage=True,
+            assignee="project_lead",
+        )
+
+    with _patch_aux_client("{}") as mock_llm:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    mock_llm.assert_not_called()
+    assert outcome.ok is False
+    assert "detection" in outcome.reason.lower() or "감지" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.assignee == "project_lead"
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage

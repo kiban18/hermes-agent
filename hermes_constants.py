@@ -1370,6 +1370,116 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     return result
 
 
+def resolve_cron_reasoning_config(
+    cfg: dict | None,
+    model: str = "",
+    job: dict | None = None,
+) -> dict | None:
+    """Resolve thinking depth for one cron fire.
+
+    Priority:
+
+    1. Explicit ``job["reasoning_effort"]`` (including ``none`` / ``false``)
+    2. Monitor jobs (``monitor_script`` / ``monitor_url``) default to off
+    3. Fleet ``cron.reasoning_effort``
+    4. :func:`resolve_reasoning_config` (per-model override, then agent)
+
+    Empty / unrecognized values fall through to the next step rather than
+    silently re-enabling thinking.
+    """
+    job = job if isinstance(job, dict) else {}
+    raw_job = job.get("reasoning_effort")
+    if raw_job is not None and not (isinstance(raw_job, str) and not raw_job.strip()):
+        parsed = parse_reasoning_effort(raw_job)
+        if parsed is not None:
+            return parsed
+
+    if job.get("monitor_script") or job.get("monitor_url"):
+        return {"enabled": False}
+
+    cfg = cfg if isinstance(cfg, dict) else {}
+    cron_cfg = cfg.get("cron")
+    if isinstance(cron_cfg, dict) and "reasoning_effort" in cron_cfg:
+        parsed = parse_reasoning_effort(cron_cfg.get("reasoning_effort"))
+        if parsed is not None:
+            return parsed
+
+    return resolve_reasoning_config(cfg, model)
+
+
+def reasoning_effort_rank(config: dict | None) -> int:
+    """Order thinking depth so a pin can refuse to go *up*.
+
+    Disabled / missing config is ``-1``. Known efforts follow
+    :data:`VALID_REASONING_EFFORTS` (minimal < low < … < ultra).
+    """
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return -1
+    effort = str(config.get("effort") or "").strip().lower()
+    try:
+        return VALID_REASONING_EFFORTS.index(effort)
+    except ValueError:
+        return -1
+
+
+def clamp_reasoning_config(
+    candidate: dict | None,
+    pin: dict | None,
+) -> dict | None:
+    """Keep *pin* when *candidate* would think harder.
+
+    Per-model overrides may only lower thinking (or turn it off). A cron
+    job/fleet pin of ``none`` or ``low`` must survive fallback and
+    ``switch_model``.
+    """
+    if pin is None:
+        return candidate
+    if candidate is None:
+        return dict(pin) if isinstance(pin, dict) else pin
+    if reasoning_effort_rank(candidate) > reasoning_effort_rank(pin):
+        return dict(pin) if isinstance(pin, dict) else pin
+    return candidate
+
+
+def resolve_switched_model_reasoning_config(
+    cfg: dict | None,
+    model: str = "",
+    *,
+    pin: dict | None = None,
+) -> dict | None:
+    """Re-resolve reasoning after a model swap, honouring an explicit pin.
+
+    Used by ``try_activate_fallback`` and ``switch_model``. Without a pin
+    this is :func:`resolve_reasoning_config` (per-model override, then
+    agent). With a pin — cron ``job["reasoning_effort"]`` or
+    ``cron.reasoning_effort`` — the pin wins unless the per-model
+    override is strictly lower.
+    """
+    resolved = resolve_reasoning_config(cfg, model)
+    return clamp_reasoning_config(resolved, pin)
+
+
+def reasoning_pin_from_agent(agent) -> dict | None:
+    """Return the sticky thinking pin for a live agent, if any.
+
+    Cron sets ``_reasoning_pin`` at init. If a cron agent is missing the
+    attribute (older snapshot), treat the current ``reasoning_config`` as
+    the pin so a later fallback cannot raise thinking.
+    """
+    pin = getattr(agent, "_reasoning_pin", None)
+    if isinstance(pin, dict):
+        return pin
+    if getattr(agent, "platform", None) == "cron":
+        current = getattr(agent, "reasoning_config", None)
+        if isinstance(current, dict):
+            try:
+                agent._reasoning_pin = dict(current)
+            except Exception:
+                pass
+            return current
+    return None
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

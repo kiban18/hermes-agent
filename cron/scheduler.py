@@ -5213,20 +5213,25 @@ def run_job(
                 f"Time: {_mon_now}"
             )
             return False, _mon_doc, _mon_alert, _mon.error
-        if not _mon.changed:
-            # Unchanged output — suppress the agent run entirely. Recorded
-            # as a silent no_change tick (visible in the executions ledger
-            # via this doc; SILENT_MARKER blocks delivery).
+        if not _mon.changed or _mon.suppress_agent:
+            # Unchanged output, or a workspace-change tick that already
+            # commented on open detection cards — suppress the agent run.
+            # Recorded as a silent tick (SILENT_MARKER blocks delivery).
+            _status = (
+                "handled_without_agent"
+                if _mon.suppress_agent
+                else "no_change (agent run suppressed)"
+            )
             logger.info(
-                "Job '%s': monitor output unchanged — suppressing agent run",
-                job_id,
+                "Job '%s': monitor %s — suppressing agent run",
+                job_id, _status,
             )
             _mon_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
                 f"**Run Time:** {_mon_now}\n"
                 f"**Mode:** monitor\n"
-                f"**Status:** no_change (agent run suppressed)\n"
+                f"**Status:** {_status}\n"
             )
             return True, _mon_doc, SILENT_MARKER, None
         # Changed (or first run): inject the monitor context into the prompt
@@ -5537,6 +5542,15 @@ def run_job(
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+
+        from cron.workspace_change_gate import is_workspace_change_monitor_job
+        _workspace_change_job = is_workspace_change_monitor_job(job)
+        _prior_cron_kanban = os.environ.get("HERMES_CRON_ENABLE_KANBAN", "_UNSET_")
+        _job_toolsets = job.get("enabled_toolsets") or []
+        if _workspace_change_job or (
+            isinstance(_job_toolsets, list) and "kanban" in _job_toolsets
+        ):
+            os.environ["HERMES_CRON_ENABLE_KANBAN"] = "1"
 
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart. Route through
@@ -6029,17 +6043,14 @@ def run_job(
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
-            # Cron jobs should always inherit the user's SOUL.md identity from
-            # HERMES_HOME. When a workdir is configured, also inject project
-            # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
-            # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
-            load_soul_identity=True,
-            # Memory is enabled for cron agents like any other agent run:
-            # MEMORY.md / USER.md load into the system prompt and the memory
-            # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            # Cron jobs inherit SOUL.md unless this is a workspace-change
+            # monitor tick: that path only needs the reconciler skill plus
+            # the remaining repo diff.
+            skip_context_files=True if _workspace_change_job else not bool(_job_workdir),
+            load_soul_identity=not _workspace_change_job,
+            # Memory stays on for ordinary cron jobs. Workspace-change
+            # monitors skip it so the reconciler prompt stays cheap.
+            skip_memory=bool(_workspace_change_job),
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
@@ -6355,6 +6366,11 @@ def run_job(
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+        if "_prior_cron_kanban" in locals():
+            if _prior_cron_kanban == "_UNSET_":
+                os.environ.pop("HERMES_CRON_ENABLE_KANBAN", None)
+            else:
+                os.environ["HERMES_CRON_ENABLE_KANBAN"] = _prior_cron_kanban
         # Release the cwd lock now that the env is restored, so a waiting
         # workdir job (or queued reader) can proceed without seeing the override.
         if _cwd_lock_acquired:

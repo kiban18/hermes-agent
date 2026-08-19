@@ -116,6 +116,10 @@ def _check_kanban_mode() -> bool:
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return True
+    if os.environ.get("HERMES_CRON_ENABLE_KANBAN", "").strip().lower() in {
+        "1", "true", "yes",
+    }:
+        return True
     return _profile_has_kanban_toolset()
 
 
@@ -132,6 +136,10 @@ def _check_kanban_orchestrator_mode() -> bool:
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
+    if os.environ.get("HERMES_CRON_ENABLE_KANBAN", "").strip().lower() in {
+        "1", "true", "yes",
+    }:
+        return True
     return _profile_has_kanban_toolset()
 
 

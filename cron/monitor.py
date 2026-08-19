@@ -60,6 +60,7 @@ class MonitorOutcome:
     first_run: bool = False
     context_block: Optional[str] = None
     error: Optional[str] = None
+    suppress_agent: bool = False
 
 
 def hash_monitor_output(output: str) -> str:
@@ -167,6 +168,40 @@ def check_monitor(job: dict) -> MonitorOutcome:
 
     first_run = last_hash is None
     old_output = "" if first_run else _read_last_output(job_id)
+
+    from cron.workspace_change_gate import (
+        apply_workspace_change_gate,
+        is_workspace_change_monitor_job,
+        owner_from_job,
+    )
+
+    if is_workspace_change_monitor_job(job):
+        remaining, _handled, slim_block = apply_workspace_change_gate(
+            old_output,
+            output,
+            author=owner_from_job(job),
+            first_run=first_run,
+        )
+        _persist_monitor_state(job_id, new_hash, output)
+        if first_run or not remaining:
+            logger.info(
+                "Monitor %s: workspace-change handled without agent "
+                "(first_run=%s remaining=%d)",
+                job_id, first_run, len(remaining),
+            )
+            return MonitorOutcome(
+                ok=True,
+                changed=True,
+                first_run=first_run,
+                context_block=None,
+                suppress_agent=True,
+            )
+        return MonitorOutcome(
+            ok=True,
+            changed=True,
+            first_run=False,
+            context_block=slim_block,
+        )
 
     shown_output = output
     if len(shown_output) > MAX_OUTPUT_CHARS:

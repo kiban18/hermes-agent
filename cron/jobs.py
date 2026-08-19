@@ -2010,6 +2010,7 @@ def create_job(
         "no_agent": normalized_no_agent,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
+        "reasoning_effort": normalized_reasoning,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
         # "last_changed_at": ...}. None until the first monitor tick.
         "monitor_state": None,

@@ -937,6 +937,12 @@ def init_agent(
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    # Cron job/fleet pins must survive fallback and mid-run model switch.
+    # Interactive sessions leave this unset so per-model overrides apply.
+    if platform == "cron" and isinstance(reasoning_config, dict):
+        agent._reasoning_pin = dict(reasoning_config)
+    else:
+        agent._reasoning_pin = None
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
