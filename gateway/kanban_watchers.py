@@ -584,6 +584,10 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    last_run = _kb.latest_run(conn, sub["task_id"])
+                                    last_run_model = (
+                                        last_run.model if last_run else None
+                                    )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -595,6 +599,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "last_run_model": last_run_model,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -827,6 +832,10 @@ class GatewayKanbanWatchersMixin:
                             # Archive is claimed so the cursor cannot wedge a
                             # later event, but it needs no Telegram briefing.
                             continue
+                        from hermes_cli.kanban_attribution import attach_worker_attribution
+                        msg = attach_worker_attribution(
+                            msg, task, last_run_model=d.get("last_run_model"),
+                        )
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)

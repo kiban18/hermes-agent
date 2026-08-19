@@ -222,6 +222,8 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    last_run_model: Optional[str] = None,
+    worker_models: Optional[list[dict]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Add derived age metrics so the UI can colour stale cards without
@@ -238,6 +240,16 @@ def _task_dict(
     d["representative_action_required"] = (
         kanban_db.representative_action_required(task)
     )
+    try:
+        from hermes_cli.kanban_attribution import resolve_task_model
+
+        d["worker_model"] = resolve_task_model(
+            task, last_run_model=last_run_model,
+        )
+    except Exception:
+        d["worker_model"] = last_run_model or task.model_override
+    d["last_run_model"] = last_run_model
+    d["worker_models"] = list(worker_models or [])
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -260,6 +272,7 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
         "author": c.author,
         "body": c.body,
         "created_at": c.created_at,
+        "model": c.model,
     }
 
 
@@ -646,14 +659,22 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        run_model_map = kanban_db.latest_run_models(conn, task_ids)
+        worker_model_map = kanban_db.task_worker_models(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(
+                t,
+                latest_summary=preview,
+                last_run_model=run_model_map.get(t.id),
+                worker_models=worker_model_map.get(t.id),
+            )
             d["board_slug"] = board or kanban_db.get_current_board()
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
@@ -744,7 +765,14 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
+        run_models = kanban_db.latest_run_models(conn, [task_id])
+        worker_models = kanban_db.task_worker_models(conn, [task_id])
+        task_d = _task_dict(
+            task,
+            latest_summary=full_summary,
+            last_run_model=run_models.get(task_id),
+            worker_models=worker_models.get(task_id),
+        )
         task_d["board_slug"] = board or kanban_db.get_current_board()
         links = _links_for(conn, task_id)
         child_ids = links["children"]

@@ -201,6 +201,39 @@
     return count && count > 1 ? tx(t, "selectedTasks", "{n} selected tasks", { n: count }) : tx(t, "thisTask", "this task");
   }
 
+  function workerModelEntries(task) {
+    var items = Array.isArray(task.worker_models) ? task.worker_models.slice() : [];
+    if (items.length === 0 && task.worker_model) {
+      items = [{
+        model: task.worker_model,
+        profile: task.assignee || null,
+        source: task.last_run_model ? "run" : "default",
+      }];
+    }
+    return items.filter(function (item) { return item && item.model; });
+  }
+
+  function workerModelChipLabel(entry, items) {
+    var same = items.filter(function (item) { return item.model === entry.model; }).length;
+    if (same > 1 && entry.profile) return entry.profile + " · " + entry.model;
+    return entry.model;
+  }
+
+  function workerModelBadges(task) {
+    var items = workerModelEntries(task);
+    return items.map(function (entry, index) {
+      var last = index === items.length - 1;
+      var who = (entry.profile ? entry.profile + " · " : "") + entry.model;
+      return h(Badge, {
+        key: (entry.profile || "") + ":" + entry.model + ":" + index,
+        variant: "outline",
+        className: "hermes-kanban-tag hermes-kanban-worker-model"
+          + (last ? " hermes-kanban-worker-model--last" : ""),
+        title: last ? "Last worker: " + who : "Earlier worker: " + who,
+      }, workerModelChipLabel(entry, items));
+    });
+  }
+
   /**
    * Hook owning the kanban plugin's modal dialog state. Returns
    *   - `request(req)` — imperative API. Resolves to
@@ -2555,14 +2588,28 @@
         ),
       ),
       h("div", { className: "flex flex-col gap-1",
-                 title: "Order cards within each status column. Recent status change ignores comments and edits." },
+                 title: "Order cards within each status column. One click toggles Priority vs Recent status change. Recent ignores comments and edits." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "sort", "Sort")),
-        h(Select, Object.assign({
-          value: props.sortOrder,
-          className: "h-8",
-        }, selectChangeHandler(props.setSortOrder)),
-          h(SelectOption, { value: "priority" }, tx(t, "sortPriority", "Priority")),
-          h(SelectOption, { value: "status_changed" }, tx(t, "sortRecentStatus", "Recent status change")),
+        h("button", {
+          type: "button",
+          role: "switch",
+          "aria-checked": props.sortOrder === "status_changed",
+          className: cn(
+            "hermes-kanban-sort-switch",
+            props.sortOrder === "status_changed" ? "is-on" : "",
+          ),
+          onClick: function () {
+            props.setSortOrder(
+              props.sortOrder === "status_changed" ? "priority" : "status_changed",
+            );
+          },
+        },
+          h("span", { className: "hermes-kanban-sort-switch-opt" },
+            tx(t, "sortPriority", "Priority")),
+          h("span", { className: "hermes-kanban-sort-switch-track", "aria-hidden": true },
+            h("span", { className: "hermes-kanban-sort-switch-knob" })),
+          h("span", { className: "hermes-kanban-sort-switch-opt" },
+            tx(t, "sortRecentStatus", "Recent status")),
         ),
       ),
       h("label", { className: "flex items-center gap-2 text-xs",
@@ -3222,6 +3269,7 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag hermes-kanban-board-slug",
                            title: `Board: ${t.board_slug}` }, t.board_slug)
               : null,
+            workerModelBadges(t),
             progress
               ? h("span", {
                   className: cn(
@@ -4137,6 +4185,12 @@
               return h("div", { key: c.id, className: "hermes-kanban-comment" },
                 h("div", { className: "hermes-kanban-comment-head" },
                   h("span", { className: "hermes-kanban-comment-author" }, c.author || "anon"),
+                  c.model
+                    ? h("span", {
+                        className: "hermes-kanban-comment-model",
+                        title: "Model that wrote this comment",
+                      }, c.model)
+                    : null,
                   h("span", { className: "hermes-kanban-comment-ago" },
                     timeAgo ? timeAgo(c.created_at) : ""),
                 ),

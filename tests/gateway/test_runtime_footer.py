@@ -88,7 +88,7 @@ def test_resolve_platform_override_wins():
             },
         },
     }
-    # Telegram picks up the global enable
+    # Telegram stays enabled (builtin default, plus global enable)
     assert resolve_footer_config(user, "telegram")["enabled"] is True
     # Slack overrides to off
     assert resolve_footer_config(user, "slack")["enabled"] is False
@@ -105,7 +105,8 @@ def test_resolve_platform_can_add_fields_only():
     }
     tg = resolve_footer_config(user, "telegram")
     assert tg["enabled"] is True
-    assert tg["fields"] == ["model", "context_pct", "cwd"]
+    # Global enable does not wipe Telegram's quieter default field set.
+    assert tg["fields"] == ["profile", "model"]
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
@@ -266,10 +267,31 @@ def test_latency_not_in_default_fields():
 
 
 def test_resolve_footer_config_default_fields_exclude_latency():
-    assert resolve_footer_config({}, "telegram")["fields"] == _LEGACY_DEFAULT_FIELDS
+    assert resolve_footer_config({}, "discord")["fields"] == _LEGACY_DEFAULT_FIELDS
     assert resolve_footer_config(
         {"display": {"runtime_footer": {"enabled": True}}}, "discord"
     )["fields"] == _LEGACY_DEFAULT_FIELDS
+
+
+def test_telegram_defaults_to_profile_and_model():
+    cfg = resolve_footer_config({}, "telegram")
+    assert cfg["enabled"] is True
+    assert cfg["fields"] == ["profile", "model"]
+    assert cfg["label"] == "AI"
+
+
+def test_telegram_footer_renders_ai_line(monkeypatch):
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    out = build_footer_line(
+        user_config={},
+        platform_key="telegram",
+        model="gemini-oauth/gemini-3.5-flash",
+        context_tokens=0,
+        context_length=None,
+        cwd="/tmp",
+        profile="proposal_lead",
+    )
+    assert out == "AI: proposal_lead · gemini-3.5-flash"
 
 
 @pytest.mark.parametrize(

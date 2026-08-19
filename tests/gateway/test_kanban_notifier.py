@@ -117,7 +117,8 @@ def test_assignee_telegram_bot_receives_each_task_state(tmp_path, monkeypatch):
         text.startswith("[완료]") and "결과: verified result" in text
         for text in messages
     )
-    assert all("Kanban" not in text and "@worker" not in text for text in messages)
+    assert any("AI: worker" in text for text in messages)
+    assert all("Kanban" not in text for text in messages)
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.profile == "worker"
     assert "within your authority" in adapter.handled[0].text

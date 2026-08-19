@@ -2,7 +2,8 @@
 
 Renders a compact footer showing runtime state (model, context %, cwd) and
 appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+except Telegram, which shows ``AI: {profile} · {model}`` so the answering
+model is visible after fallback.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -12,6 +13,7 @@ Config (``~/.hermes/config.yaml``)::
         fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
 Available fields:
+    profile      — active Hermes profile name (``proposal_lead``)
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
@@ -38,6 +40,7 @@ import os
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+_TELEGRAM_DEFAULT_FIELDS: tuple[str, ...] = ("profile", "model")
 _SEP = " · "
 
 
@@ -73,7 +76,15 @@ def resolve_footer_config(
         2. ``display.runtime_footer``
         3. ``display.platforms.<platform_key>.runtime_footer``
     """
-    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS)}
+    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS), "label": ""}
+    if platform_key == "telegram":
+        # Telegram replies otherwise look anonymous across profile gateways
+        # and fallback models. Quiet: profile + model only, no cwd/%.
+        resolved = {
+            "enabled": True,
+            "fields": list(_TELEGRAM_DEFAULT_FIELDS),
+            "label": "AI",
+        }
     cfg = (user_config or {}).get("display") or {}
 
     global_cfg = cfg.get("runtime_footer")
@@ -82,6 +93,8 @@ def resolve_footer_config(
             resolved["enabled"] = bool(global_cfg.get("enabled"))
         if isinstance(global_cfg.get("fields"), list) and global_cfg["fields"]:
             resolved["fields"] = [str(f) for f in global_cfg["fields"]]
+        if "label" in global_cfg:
+            resolved["label"] = str(global_cfg.get("label") or "")
 
     if platform_key:
         platforms = cfg.get("platforms") or {}
@@ -93,6 +106,8 @@ def resolve_footer_config(
                     resolved["enabled"] = bool(plat_footer.get("enabled"))
                 if isinstance(plat_footer.get("fields"), list) and plat_footer["fields"]:
                     resolved["fields"] = [str(f) for f in plat_footer["fields"]]
+                if "label" in plat_footer:
+                    resolved["label"] = str(plat_footer.get("label") or "")
 
     return resolved
 
@@ -115,7 +130,9 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    profile: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    label: str = "",
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -124,7 +141,16 @@ def format_runtime_footer(
     """
     parts: list[str] = []
     for field in fields:
-        if field == "model":
+        if field == "profile":
+            p = (
+                profile
+                or os.environ.get("HERMES_PROFILE")
+                or os.environ.get("HERMES_PROFILE_NAME")
+                or ""
+            ).strip()
+            if p:
+                parts.append(p)
+        elif field == "model":
             m = _model_short(model)
             if m:
                 parts.append(m)
@@ -145,7 +171,11 @@ def format_runtime_footer(
 
     if not parts:
         return ""
-    return _SEP.join(parts)
+    line = _SEP.join(parts)
+    prefix = str(label or "").strip()
+    if prefix:
+        return f"{prefix}: {line}"
+    return line
 
 
 def build_footer_line(
@@ -157,6 +187,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    profile: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -177,5 +208,7 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        profile=profile,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        label=str(cfg.get("label") or ""),
     )

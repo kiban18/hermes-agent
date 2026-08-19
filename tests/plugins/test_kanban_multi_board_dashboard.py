@@ -141,6 +141,25 @@ def test_dashboard_bundle_has_all_boards_switcher():
     assert "function isAllBoards(slug)" in js
     assert "hermes-kanban-board-slug" in js
     assert "t.board_slug" in js
+    assert "workerModelBadges" in js
+    assert "worker_models" in js
+    assert "last_run_model" in js
+    assert "hermes-kanban-worker-model" in js
+    assert "hermes-kanban-comment-model" in js
+
+
+def test_dashboard_sort_is_a_one_click_switch():
+    """Priority vs recent-status must toggle without opening a select."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    ).read_text()
+    assert 'role: "switch"' in js
+    assert "hermes-kanban-sort-switch" in js
+    assert "status_changed" in js
+    assert "SelectOption, { value: \"priority\" }" not in js
+    assert ".hermes-kanban-sort-switch" in css
 
 
 def test_dashboard_card_chips_use_readable_ui_font():

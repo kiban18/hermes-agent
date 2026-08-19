@@ -1268,6 +1268,8 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Actual model this attempt used (override, profile default, or fallback).
+    model: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1275,6 +1277,7 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        keys = row.keys()
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1292,6 +1295,7 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            model=(row["model"] if "model" in keys and row["model"] else None),
         )
 
 
@@ -1302,6 +1306,7 @@ class Comment:
     author: str
     body: str
     created_at: int
+    model: Optional[str] = None
 
 
 @dataclass
@@ -1439,7 +1444,8 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    model      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -1477,7 +1483,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Model this attempt actually used (pin, profile default, or fallback).
+    model               TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2767,6 +2775,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
 
+    run_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "model" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "model", "model TEXT")
+
+    comment_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
+    ).fetchone() is not None
+    if comment_table_exists:
+        comment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")
+        }
+        if "model" not in comment_cols:
+            _add_column_if_missing(conn, "task_comments", "model", "model TEXT")
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2868,7 +2896,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
+        " created_at INTEGER NOT NULL, model TEXT)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
     "task_runs": (
@@ -2879,7 +2907,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, model TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4183,14 +4211,49 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+def _comment_writer_model(explicit: Optional[str] = None) -> Optional[str]:
+    """Prefer the caller stamp, else the live agent model for this process."""
+    try:
+        from hermes_cli.kanban_attribution import short_model_name
+    except Exception:
+        short_model_name = lambda value: (str(value).strip() or None)  # noqa: E731
+    labeled = short_model_name(explicit)
+    if labeled:
+        return labeled
+    try:
+        from hermes_cli.active_runtime_model import get_active_runtime_model
+
+        return get_active_runtime_model()
+    except Exception:
+        return None
+
+
+def _comment_from_row(row: sqlite3.Row) -> Comment:
+    keys = row.keys()
+    return Comment(
+        id=row["id"],
+        task_id=row["task_id"],
+        author=row["author"],
+        body=row["body"],
+        created_at=int(row["created_at"]),
+        model=(row["model"] if "model" in keys and row["model"] else None),
+    )
+
+
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    model: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
+    writer_model = _comment_writer_model(model)
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
@@ -4199,11 +4262,14 @@ def add_comment(
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, model) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now, writer_model),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn, task_id, "commented",
+            {"author": author, "len": len(body), "model": writer_model},
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -4212,16 +4278,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 def list_comments_after(
@@ -4235,20 +4292,11 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT * FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -4655,6 +4703,45 @@ def _ensure_assignee_telegram_notify_sub(
         return False
 
 
+def _intended_run_model(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Pin or current assignee profile default — not the last actual run."""
+    row = conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        from hermes_cli.kanban_attribution import resolve_task_model
+        from types import SimpleNamespace
+
+        return resolve_task_model(
+            SimpleNamespace(
+                assignee=row["assignee"],
+                model_override=row["model_override"],
+            )
+        )
+    except Exception:
+        return None
+
+
+def _actual_run_model(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Prefer the live agent model (fallback included), else the intended pin."""
+    try:
+        from hermes_cli.active_runtime_model import get_active_runtime_model
+
+        live = get_active_runtime_model()
+        if live:
+            return live
+    except Exception:
+        pass
+    return _intended_run_model(conn, task_id)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4681,6 +4768,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    run_model = _actual_run_model(conn, task_id)
     conn.execute(
         """
         UPDATE task_runs
@@ -4689,6 +4777,7 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               model         = COALESCE(?, model),
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
@@ -4702,6 +4791,7 @@ def _end_run(
             summary,
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            run_model,
             now,
             run_id,
         ),
@@ -4755,15 +4845,16 @@ def _synthesize_ended_run(
         INSERT INTO task_runs (
             task_id, profile, step_key,
             status, outcome,
-            summary, error, metadata,
+            summary, error, metadata, model,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            _actual_run_model(conn, task_id),
             now, now,
         ),
     )
@@ -5110,8 +5201,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, model
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5121,6 +5212,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                _intended_run_model(conn, task_id),
             ),
         )
         run_id = run_cur.lastrowid
@@ -5218,8 +5310,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, model
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5229,6 +5321,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                _intended_run_model(conn, task_id),
             ),
         )
         run_id = run_cur.lastrowid
@@ -11806,7 +11899,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
+            safe_model = (c.model or "").replace("`", "")
+            if safe_model:
+                lines.append(
+                    f"comment from worker `{safe_author}` "
+                    f"(`{safe_model}`) at {ts_disp}:"
+                )
+            else:
+                lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
@@ -12701,3 +12801,104 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def latest_run_models(
+    conn: sqlite3.Connection, task_ids: Iterable[str]
+) -> dict[str, str]:
+    """Batch-fetch the newest run's model for each task id.
+
+    Used by the dashboard so cards show the last worker's actual model
+    instead of the current assignee's profile default.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT task_id, model FROM (
+                SELECT task_id, model,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+                       ) AS rn
+                  FROM task_runs
+                 WHERE task_id IN ({placeholders})
+            ) WHERE rn = 1 AND model IS NOT NULL AND model != ''
+            """,
+            ids,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {
+        r["task_id"]: r["model"]
+        for r in rows
+        if r["model"]
+    }
+
+
+def task_worker_models(
+    conn: sqlite3.Connection, task_ids: Iterable[str]
+) -> dict[str, list[dict[str, Optional[str]]]]:
+    """First-seen profile+model workers per task, oldest first.
+
+    Unions stamped comment authors with run models so a card that passed
+    through several sessions lists every AI that actually wrote or ran.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    raw: list[sqlite3.Row] = []
+    try:
+        raw.extend(
+            conn.execute(
+                f"""
+                SELECT task_id, author AS profile, model,
+                       MIN(created_at) AS first_at
+                  FROM task_comments
+                 WHERE task_id IN ({placeholders})
+                   AND model IS NOT NULL AND TRIM(model) != ''
+                 GROUP BY task_id, author, model
+                """,
+                ids,
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        raw.extend(
+            conn.execute(
+                f"""
+                SELECT task_id, profile, model,
+                       MIN(COALESCE(ended_at, started_at)) AS first_at
+                  FROM task_runs
+                 WHERE task_id IN ({placeholders})
+                   AND model IS NOT NULL AND TRIM(model) != ''
+                 GROUP BY task_id, profile, model
+                """,
+                ids,
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return {}
+    first_seen: dict[tuple[str, str, str], int] = {}
+    for row in raw:
+        model = str(row["model"] or "").strip()
+        if not model:
+            continue
+        key = (row["task_id"], str(row["profile"] or ""), model)
+        at = int(row["first_at"] or 0)
+        if key not in first_seen or at < first_seen[key]:
+            first_seen[key] = at
+    out: dict[str, list[dict[str, Optional[str]]]] = {}
+    for (task_id, profile, model), at in sorted(
+        first_seen.items(), key=lambda item: (item[0][0], item[1], item[0][1])
+    ):
+        out.setdefault(task_id, []).append({
+            "profile": profile or None,
+            "model": model,
+        })
+    return out

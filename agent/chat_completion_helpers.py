@@ -2648,6 +2648,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # the stale value from the previous model.  See #22387.
         agent._config_context_length = None
         agent.model = fb_model
+        try:
+            from hermes_cli.active_runtime_model import note_active_runtime_model
+            note_active_runtime_model(agent.model)
+        except Exception:
+            pass
         agent.provider = fb_provider
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url

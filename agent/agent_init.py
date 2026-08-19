@@ -1556,6 +1556,11 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    try:
+        from hermes_cli.active_runtime_model import note_active_runtime_model
+        note_active_runtime_model(agent.model)
+    except Exception:
+        pass
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

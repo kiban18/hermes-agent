@@ -1342,6 +1342,11 @@ def try_recover_primary_transport(
         rt = agent._primary_runtime
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent.model = rt["model"]
+        try:
+            from hermes_cli.active_runtime_model import note_active_runtime_model
+            note_active_runtime_model(agent.model)
+        except Exception:
+            pass
         agent.provider = rt["provider"]
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]
@@ -1573,6 +1578,11 @@ def restore_primary_runtime(agent) -> bool:
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
+        try:
+            from hermes_cli.active_runtime_model import note_active_runtime_model
+            note_active_runtime_model(agent.model)
+        except Exception:
+            pass
         agent.provider = rt["provider"]
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
@@ -2700,6 +2710,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
         # ── Swap core runtime fields ──
         agent.model = new_model
+        try:
+            from hermes_cli.active_runtime_model import note_active_runtime_model
+            note_active_runtime_model(agent.model)
+        except Exception:
+            pass
         agent.provider = new_provider
         agent.requested_provider = new_provider
         # Re-read reasoning_echo from config so the flag reflects the new
