@@ -68,12 +68,46 @@ class TestTelegramExecApproval:
         assert result.success is True
         assert result.message_id == "42"
 
-        adapter._bot.send_message.assert_called_once()
-        kwargs = adapter._bot.send_message.call_args[1]
+        assert adapter._bot.send_message.call_count == 2
+        brief_kwargs = adapter._bot.send_message.call_args_list[0][1]
+        kwargs = adapter._bot.send_message.call_args_list[1][1]
+        assert "[결정 필요] 명령 실행 전 확인" in brief_kwargs["text"]
+        assert "/important" in brief_kwargs["text"]
+        assert "재귀 삭제" in brief_kwargs["text"]
+        assert brief_kwargs.get("reply_markup") is None
         assert kwargs["chat_id"] == 12345
         assert "rm -rf /important" in kwargs["text"]
-        assert "dangerous deletion" in kwargs["text"]
+        assert "dangerous deletion" not in kwargs["text"]
+        assert "왜 확인이 필요한가" in kwargs["text"]
+        assert "파일을 폴더 단위로 지우거나" in kwargs["text"] or "지우는 명령" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
+
+    @pytest.mark.asyncio
+    async def test_read_only_http_brief_precedes_raw_card(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=41), SimpleNamespace(message_id=42)]
+        )
+        command = (
+            "curl -sL https://example.test/login | python3 -c \""
+            "import sys,re; html=sys.stdin.read(); print(re.sub('<[^>]+>',' ',html)[:800])\""
+        )
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345", command=command, session_key="s",
+            description="pipe to interpreter",
+        )
+
+        assert result.success is True
+        calls = adapter._bot.send_message.call_args_list
+        assert len(calls) == 2
+        brief, card = calls[0][1], calls[1][1]
+        assert "외부 상태 변경은 없습니다" in brief["text"]
+        assert "시스템에 영향을 줄 수" not in brief["text"]
+        assert command not in brief["text"]
+        assert "curl -sL https://example.test/login" in card["text"]
+        assert "python3 -c" in card["text"]
+        assert card.get("reply_markup") is not None
 
 
     @pytest.mark.asyncio

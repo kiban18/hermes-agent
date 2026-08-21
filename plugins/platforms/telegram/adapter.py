@@ -6206,9 +6206,28 @@ class TelegramAdapter(BasePlatformAdapter):
     _EA_HEADER = "⚠️ <b>명령 실행 승인이 필요합니다</b>\n\n"
     _EA_CODE_OPEN = "<pre>"
     _EA_CODE_CLOSE = "</pre>\n\n"
-    _EA_REASON_LABEL = "승인이 필요한 이유: "
+    _EA_REASON_LABEL = ""
     _EA_SMART_DENY_LINE = "\n\n<b>자동 거부:</b> 관리자 예외 승인은 이번 작업에만 적용됩니다."
-    _EA_CMD_BUDGET = 3800
+    _EA_CMD_BUDGET = 3200
+
+    def _format_exec_approval(
+        self,
+        command: str,
+        description: str = "dangerous command",
+        smart_denied: bool = False,
+    ) -> str:
+        from gateway.approval_reason_ko import humanize_approval_reason
+
+        cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
+        reason = humanize_approval_reason(command, description)
+        text = (
+            f"{self._EA_HEADER}"
+            f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
+            f"{self._ea_escape(reason)}"
+        )
+        if smart_denied:
+            text += self._EA_SMART_DENY_LINE
+        return text
 
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
@@ -6230,6 +6249,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            from gateway.approval_reason_ko import build_approval_brief
+
             text = self._format_exec_approval(command, description, smart_denied)
 
             # Resolve thread context for thread replies
@@ -6278,6 +6299,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_mode=self._reply_to_mode
                 )
             )
+
+            # The raw command is evidence, not a decision brief. Send the
+            # decision-ready context first from this shared adapter so every
+            # Telegram profile receives it, including long-lived sessions.
+            brief_kwargs = dict(kwargs)
+            brief_kwargs["text"] = self._ea_escape(
+                build_approval_brief(command, description)
+            )
+            brief_kwargs.pop("reply_markup", None)
+            await self._send_message_with_thread_fallback(**brief_kwargs)
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
