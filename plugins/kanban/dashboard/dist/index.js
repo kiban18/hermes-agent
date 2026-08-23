@@ -2212,6 +2212,33 @@
     // OR when any non-default board exists.
     const totalAcrossAllBoards = list.reduce(function (n, b) { return n + (b.total || 0); }, 0);
     const shouldShow = hasMultipleBoards || totalAcrossAllBoards > 0;
+    const boardSelectRef = useRef(null);
+    const fitBoardListbox = useCallback(function () {
+      const root = boardSelectRef.current;
+      if (!root) return;
+      const trigger = root.querySelector("[role=\"combobox\"]") || root;
+      const bottom = trigger.getBoundingClientRect().bottom;
+      const room = Math.floor(window.innerHeight - bottom - 12);
+      root.style.setProperty(
+        "--kanban-board-listbox-max",
+        Math.max(160, room) + "px",
+      );
+    }, []);
+    useEffect(function () {
+      fitBoardListbox();
+      window.addEventListener("resize", fitBoardListbox);
+      window.addEventListener("scroll", fitBoardListbox, true);
+      const node = boardSelectRef.current;
+      const obs = node && typeof MutationObserver !== "undefined"
+        ? new MutationObserver(fitBoardListbox)
+        : null;
+      if (obs && node) obs.observe(node, { childList: true, subtree: true });
+      return function () {
+        window.removeEventListener("resize", fitBoardListbox);
+        window.removeEventListener("scroll", fitBoardListbox, true);
+        if (obs) obs.disconnect();
+      };
+    }, [fitBoardListbox, shouldShow]);
     if (!shouldShow) {
       return h("div", {
         className: "hermes-kanban-boardswitcher-compact",
@@ -2236,12 +2263,12 @@
     return h("div", { className: "hermes-kanban-boardswitcher" },
       h("div", { className: "hermes-kanban-boardswitcher-inner" },
         h("div", { className: "flex flex-col gap-0.5" },
-          h("div", { className: "text-[11px] tracking-wider text-muted-foreground" },
+          h("div", { className: "hermes-kanban-boardswitcher-label" },
             tx(t, "board", "Board")),
-          h("div", { className: "flex items-center gap-2" },
+          h("div", { className: "flex items-center gap-2", ref: boardSelectRef },
             h(Select, Object.assign({
               value: props.board,
-              className: "h-8 min-w-[220px]",
+              className: "h-8 min-w-[220px] hermes-kanban-board-select",
               "aria-label": "Switch kanban board",
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
@@ -2590,26 +2617,31 @@
       h("div", { className: "flex flex-col gap-1",
                  title: "Order cards within each status column. One click toggles Priority vs Recent status change. Recent ignores comments and edits." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "sort", "Sort")),
-        h("button", {
-          type: "button",
-          role: "switch",
-          "aria-checked": props.sortOrder === "status_changed",
-          className: cn(
-            "hermes-kanban-sort-switch",
-            props.sortOrder === "status_changed" ? "is-on" : "",
-          ),
-          onClick: function () {
-            props.setSortOrder(
-              props.sortOrder === "status_changed" ? "priority" : "status_changed",
-            );
-          },
+        h("div", {
+          className: "hermes-kanban-sort-switch",
+          role: "radiogroup",
+          "aria-label": tx(t, "sort", "Sort"),
         },
-          h("span", { className: "hermes-kanban-sort-switch-opt" },
-            tx(t, "sortPriority", "Priority")),
-          h("span", { className: "hermes-kanban-sort-switch-track", "aria-hidden": true },
-            h("span", { className: "hermes-kanban-sort-switch-knob" })),
-          h("span", { className: "hermes-kanban-sort-switch-opt" },
-            tx(t, "sortRecentStatus", "Recent status")),
+          h("button", {
+            type: "button",
+            role: "radio",
+            "aria-checked": props.sortOrder !== "status_changed",
+            className: cn(
+              "hermes-kanban-sort-switch-opt",
+              props.sortOrder !== "status_changed" ? "is-on" : "",
+            ),
+            onClick: function () { props.setSortOrder("priority"); },
+          }, tx(t, "sortPriority", "Priority")),
+          h("button", {
+            type: "button",
+            role: "radio",
+            "aria-checked": props.sortOrder === "status_changed",
+            className: cn(
+              "hermes-kanban-sort-switch-opt",
+              props.sortOrder === "status_changed" ? "is-on" : "",
+            ),
+            onClick: function () { props.setSortOrder("status_changed"); },
+          }, tx(t, "sortRecentStatus", "Recent status")),
         ),
       ),
       h("label", { className: "flex items-center gap-2 text-xs",

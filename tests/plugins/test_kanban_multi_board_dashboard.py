@@ -140,6 +140,9 @@ def test_dashboard_bundle_has_all_boards_switcher():
     assert "const ALL_BOARDS_SLUG = \"*\";" in js
     assert "function isAllBoards(slug)" in js
     assert "hermes-kanban-board-slug" in js
+    assert "hermes-kanban-boardswitcher-label" in js
+    assert "hermes-kanban-board-select" in js
+    assert "--kanban-board-listbox-max" in js
     assert "t.board_slug" in js
     assert "workerModelBadges" in js
     assert "worker_models" in js
@@ -155,11 +158,13 @@ def test_dashboard_sort_is_a_one_click_switch():
     css = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
     ).read_text()
-    assert 'role: "switch"' in js
+    assert 'role: "radiogroup"' in js
     assert "hermes-kanban-sort-switch" in js
+    assert "hermes-kanban-sort-switch-opt" in js
     assert "status_changed" in js
     assert "SelectOption, { value: \"priority\" }" not in js
-    assert ".hermes-kanban-sort-switch" in css
+    assert "hermes-kanban-sort-switch-knob" not in css
+    assert ".hermes-kanban-sort-switch-opt.is-on" in css
 
 
 def test_dashboard_card_chips_use_readable_ui_font():
