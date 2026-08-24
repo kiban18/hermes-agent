@@ -66,6 +66,12 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "status", help="Show auth status for a provider"
     )
     auth_status.add_argument("provider", help="Provider id")
+    auth_status.add_argument(
+        "--live",
+        action="store_true",
+        help="Run one short request and verify the actual provider/model from usage",
+    )
+    auth_status.add_argument("--model", help="Model used by --live")
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state"
     )

@@ -2490,10 +2490,26 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
         from agent.moa_loop import build_moa_facade
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
+    _validate_proxy_env_urls()
+    if agent.provider == "cursor" or str(client_kwargs.get("base_url", "")).startswith("cursor://"):
+        from agent.cursor_client import CursorClient
+
+        safe_kwargs = {
+            key: value
+            for key, value in client_kwargs.items()
+            if key in {"api_key", "base_url", "default_headers", "timeout"}
+        }
+        client = CursorClient(model=getattr(agent, "model", None), **safe_kwargs)
+        _ra().logger.info(
+            "Cursor client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
-    _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
@@ -2501,6 +2517,21 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
             "Copilot ACP client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+    if agent.provider == "gemini-oauth":
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+        }
+        client = GeminiCloudCodeClient(**safe_kwargs)
+        _ra().logger.info(
+            "Gemini Code Assist client created (%s, shared=%s) %s",
             reason,
             shared,
             agent._client_log_context(),
@@ -2601,6 +2632,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
+    if agent.provider == "genspark":
+        from agent.genspark_client import GensparkClient
+
+        client = GensparkClient(client)
     _ra().logger.info(
         "OpenAI client created (%s, shared=%s) %s",
         reason,

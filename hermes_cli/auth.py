@@ -305,6 +305,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cursor": ProviderConfig(
+        id="cursor",
+        name="Cursor Composer",
+        auth_type="external_process",
+        inference_base_url="cursor://agent",
+        api_key_env_vars=("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"),
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -312,6 +319,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
         base_url_env_var="GEMINI_BASE_URL",
+    ),
+    "gemini-oauth": ProviderConfig(
+        id="gemini-oauth",
+        name="Gemini Code Assist (OAuth)",
+        auth_type="oauth_external",
+        inference_base_url="https://cloudcode-pa.googleapis.com/v1internal",
+        base_url_env_var="GEMINI_CODE_ASSIST_BASE_URL",
     ),
     "zai": ProviderConfig(
         id="zai",
@@ -7179,11 +7193,81 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _runtime_resolver_auth_status(
+    provider: str,
+    resolver: Callable[[], Dict[str, str]],
+    *,
+    configured: bool,
+) -> Dict[str, Any]:
+    status: Dict[str, Any] = {
+        "provider": provider,
+        "configured": configured,
+        "authenticated": False,
+        "usable": False,
+        "live_verified": False,
+        "logged_in": False,
+    }
+    try:
+        creds = resolver()
+        usable = has_usable_secret(creds.get("api_key"))
+        status.update(
+            configured=True,
+            authenticated=usable,
+            usable=usable,
+            logged_in=usable,
+            source=creds.get("source", "runtime-resolver"),
+        )
+    except Exception as exc:
+        status["error"] = str(exc)[:240]
+    return status
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = (provider_id or get_active_provider() or "").strip().lower()
     if not target:
-        return {"logged_in": False}
+        return {
+            "logged_in": False,
+            "configured": False,
+            "authenticated": False,
+            "usable": False,
+            "live_verified": False,
+        }
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(target)
+        if profile is not None:
+            target = profile.name
+    except Exception:
+        pass
+    if target == "cursor":
+        from agent.cursor_client import resolve_cursor_runtime_credentials
+        from agent.secret_scope import get_secret
+
+        configured = any(
+            has_usable_secret(get_secret(name, ""))
+            for name in ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN")
+        )
+        return _runtime_resolver_auth_status(
+            target, resolve_cursor_runtime_credentials, configured=configured
+        )
+    if target == "genspark":
+        from agent.genspark_auth import genspark_config_path, resolve_genspark_runtime_credentials
+        from agent.secret_scope import get_secret
+
+        configured = has_usable_secret(get_secret("GSK_API_KEY", "")) or genspark_config_path().is_file()
+        return _runtime_resolver_auth_status(
+            target, resolve_genspark_runtime_credentials, configured=configured
+        )
+    if target == "gemini-oauth":
+        from agent.gemini_oauth import gemini_oauth_creds_path, resolve_gemini_oauth_runtime_credentials
+
+        return _runtime_resolver_auth_status(
+            target,
+            resolve_gemini_oauth_runtime_credentials,
+            configured=gemini_oauth_creds_path().is_file(),
+        )
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":

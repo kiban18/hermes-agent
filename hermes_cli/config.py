@@ -5914,7 +5914,7 @@ def config_command(args):
 
 
 # ── Profile-driven env var injection ─────────────────────────────────────────
-# Any provider registered in providers/ with auth_type="api_key" automatically
+# Any provider registered in providers/ with credential env vars automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
 # Runs once at import time.
 
@@ -5933,7 +5933,7 @@ def _inject_profile_env_vars() -> None:
     try:
         from providers import list_providers
         for _pp in list_providers():
-            if _pp.auth_type not in {"api_key",}:
+            if _pp.auth_type not in {"api_key", "external_process", "oauth_external"}:
                 continue
             for _var in _pp.env_vars:
                 if _var in OPTIONAL_ENV_VARS:

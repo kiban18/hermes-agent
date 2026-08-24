@@ -590,6 +590,8 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "cursor-agent": "cursor",
+    "cursor-ultra": "cursor",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -6518,6 +6520,64 @@ def resolve_provider_client(
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
+
+    if provider == "gemini-oauth":
+        try:
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+            from agent.gemini_oauth import (
+                DEFAULT_MODEL,
+                resolve_gemini_oauth_runtime_credentials,
+            )
+
+            creds = resolve_gemini_oauth_runtime_credentials()
+            client = GeminiCloudCodeClient(
+                api_key=(explicit_api_key or "").strip() or creds.get("api_key", ""),
+                base_url=explicit_base_url or creds.get("base_url"),
+                project_id=creds.get("project"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: gemini-oauth requested but "
+                "Code Assist OAuth failed: %s",
+                exc,
+            )
+            return None, None
+        final_model = _normalize_resolved_model(model or DEFAULT_MODEL, provider)
+        return (
+            _to_async_client(client, final_model, is_vision=is_vision) if async_mode
+            else (client, final_model)
+        )
+
+    if provider == "cursor":
+        try:
+            from agent.cursor_client import (
+                AsyncCursorClient,
+                CursorClient,
+                DEFAULT_CURSOR_MODEL,
+                resolve_cursor_runtime_credentials,
+            )
+            creds = resolve_cursor_runtime_credentials(
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+            )
+            client_cls = AsyncCursorClient if async_mode else CursorClient
+            client = client_cls(
+                api_key=creds["api_key"],
+                cursor_bin=creds["command"],
+                model=model or DEFAULT_CURSOR_MODEL,
+                base_url=creds["base_url"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: cursor requested but the "
+                "cursor-agent client could not be built: %s",
+                exc,
+            )
+            return None, None
+        final_model = _normalize_resolved_model(model or DEFAULT_CURSOR_MODEL, provider)
+        # AsyncCursorClient is already async-native, so it is returned as-is
+        # rather than going through the _to_async_client sync-wrapper.
+        return client, final_model
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":

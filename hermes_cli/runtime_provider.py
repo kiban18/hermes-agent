@@ -2134,6 +2134,62 @@ def resolve_runtime_provider(
             logger.info("Qwen OAuth credentials failed; "
                         "falling through to next provider.")
 
+    if provider == "gemini-oauth":
+        try:
+            from agent.gemini_oauth import resolve_gemini_oauth_runtime_credentials
+
+            creds = resolve_gemini_oauth_runtime_credentials()
+            return {
+                "provider": "gemini-oauth",
+                "api_mode": "chat_completions",
+                "base_url": (creds.get("base_url") or "").rstrip("/"),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "gemini-cli"),
+                "project": creds.get("project", ""),
+                "requested_provider": requested_provider,
+            }
+        except Exception as exc:
+            if requested_provider != "auto":
+                raise AuthError(
+                    f"Gemini Code Assist OAuth is not available: {exc}",
+                    provider="gemini-oauth",
+                    code="gemini_oauth_unavailable",
+                ) from exc
+            logger.info(
+                "Gemini Code Assist OAuth credentials failed; "
+                "falling through to next provider."
+            )
+
+    if provider == "cursor":
+        from agent.cursor_client import resolve_cursor_runtime_credentials
+
+        creds = resolve_cursor_runtime_credentials(
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
+        return {
+            "provider": "cursor",
+            "api_mode": "chat_completions",
+            "base_url": creds["base_url"],
+            "api_key": creds["api_key"],
+            "command": creds["command"],
+            "source": creds["source"],
+            "requested_provider": requested_provider,
+        }
+
+    if provider == "genspark":
+        from agent.genspark_auth import resolve_genspark_runtime_credentials
+
+        creds = resolve_genspark_runtime_credentials()
+        return {
+            "provider": "genspark",
+            "api_mode": "chat_completions",
+            "base_url": creds["base_url"].rstrip("/"),
+            "api_key": creds["api_key"],
+            "source": creds.get("source", "gsk-cli"),
+            "requested_provider": requested_provider,
+        }
+
     if provider == "minimax-oauth":
         pconfig = PROVIDER_REGISTRY.get(provider)
         if pconfig and pconfig.auth_type == "oauth_minimax":

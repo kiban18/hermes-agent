@@ -1677,3 +1677,43 @@ def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monke
     assert resolved["provider"] == "opencode-free"
     assert resolved["api_key"] == "opencode-zen-free-keyless"
     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+
+
+def test_cursor_runtime_uses_cursor_credential_resolver(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "cursor")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(
+        "agent.cursor_client.resolve_cursor_runtime_credentials",
+        lambda **_: {
+            "api_key": "cursor-test-key",
+            "base_url": "cursor://agent",
+            "command": "/usr/local/bin/cursor-agent",
+            "source": "CURSOR_API_KEY",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="cursor")
+
+    assert resolved["provider"] == "cursor"
+    assert resolved["api_key"] == "cursor-test-key"
+    assert resolved["base_url"] == "cursor://agent"
+    assert resolved["source"] == "CURSOR_API_KEY"
+
+
+def test_genspark_runtime_uses_gsk_cli_credential_resolver(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "genspark")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(
+        "agent.genspark_auth.resolve_genspark_runtime_credentials",
+        lambda: {
+            "api_key": "genspark-test-key",
+            "base_url": "https://www.genspark.ai/api/llm_proxy/v1",
+            "source": "gsk-cli",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="genspark")
+
+    assert resolved["provider"] == "genspark"
+    assert resolved["api_key"] == "genspark-test-key"
+    assert resolved["source"] == "gsk-cli"

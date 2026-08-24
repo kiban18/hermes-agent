@@ -3,8 +3,12 @@
 from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
+import json
 import math
+from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 import uuid
@@ -507,21 +511,137 @@ def auth_reset_command(args) -> None:
     print(f"Reset status on {count} {provider} credentials")
 
 
+def _usage_verification(
+    requested_provider: str,
+    requested_model: str,
+    report: dict,
+    *,
+    returncode: int,
+) -> dict:
+    actual_provider = str(report.get("provider") or "").strip().lower()
+    actual_model = str(report.get("model") or "").strip()
+    verified = bool(
+        returncode == 0
+        and report.get("completed")
+        and not report.get("failed")
+        and actual_provider == requested_provider.strip().lower()
+        and actual_model == requested_model
+    )
+    result = {
+        "live_verified": verified,
+        "usable": verified,
+        "requested_model": requested_model,
+        "actual_provider": actual_provider,
+        "actual_model": actual_model,
+    }
+    if actual_provider and actual_provider != requested_provider.strip().lower():
+        result["live_error"] = (
+            f"provider mismatch: requested {requested_provider}, got {actual_provider}"
+        )
+    elif actual_model and actual_model != requested_model:
+        result["live_error"] = (
+            f"model mismatch: requested {requested_model}, got {actual_model}"
+        )
+    return result
+
+
+def _default_live_model(provider: str) -> str:
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        if profile is not None:
+            return profile.default_aux_model or next(iter(profile.fallback_models), "")
+    except Exception:
+        pass
+    return ""
+
+
+def _run_provider_live_probe(provider: str, model: str) -> dict:
+    with tempfile.TemporaryDirectory(prefix="hermes-auth-status-") as tmp:
+        usage_path = Path(tmp) / "usage.json"
+        hermes_script = Path(__file__).resolve().parent.parent / "hermes"
+        command = [
+            sys.executable,
+            str(hermes_script),
+            "--provider",
+            provider,
+            "--model",
+            model,
+            "-z",
+            "Reply with OK only.",
+            "--usage-file",
+            str(usage_path),
+        ]
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "live_verified": False,
+                "usable": False,
+                "requested_model": model,
+                "actual_provider": "",
+                "actual_model": "",
+                "live_error": "probe timed out after 180 seconds",
+            }
+        try:
+            report = json.loads(usage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = {}
+        result = _usage_verification(provider, model, report, returncode=proc.returncode)
+        if not result["live_verified"] and not result.get("live_error"):
+            detail = report.get("failure") or proc.stderr.strip() or proc.stdout.strip()
+            if detail:
+                result["live_error"] = str(detail)[-240:]
+        return result
+
+
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
     if not provider:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     status = auth_mod.get_auth_status(provider)
+    if getattr(args, "live", False):
+        probe_provider = str(status.get("provider") or provider)
+        model = str(getattr(args, "model", "") or _default_live_model(probe_provider)).strip()
+        if not model:
+            raise SystemExit("--live requires --model for this provider")
+        status.update(_run_provider_live_probe(probe_provider, model))
     if not status.get("logged_in"):
         reason = status.get("error")
         if reason:
             print(f"{provider}: logged out ({reason})")
         else:
             print(f"{provider}: logged out")
-        return
-
-    print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    else:
+        print(f"{provider}: logged in")
+    logged_in = bool(status.get("logged_in"))
+    for key, default in (
+        ("configured", logged_in),
+        ("authenticated", logged_in),
+        ("usable", logged_in),
+        ("live_verified", False),
+    ):
+        print(f"  {key}: {str(bool(status.get(key, default))).lower()}")
+    for key in (
+        "source",
+        "requested_model",
+        "actual_provider",
+        "actual_model",
+        "live_error",
+        "auth_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "expires_at",
+        "api_base_url",
+    ):
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")

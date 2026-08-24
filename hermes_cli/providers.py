@@ -82,6 +82,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://portal.qwen.ai/v1",
         base_url_env_var="HERMES_QWEN_BASE_URL",
     ),
+    "gemini-oauth": HermesOverlay(
+        transport="openai_chat",
+        auth_type="oauth_external",
+        base_url_override="https://cloudcode-pa.googleapis.com/v1internal",
+        base_url_env_var="GEMINI_CODE_ASSIST_BASE_URL",
+    ),
     "lmstudio": HermesOverlay(
         transport="openai_chat",
         auth_type="api_key",
@@ -320,6 +326,11 @@ ALIASES: Dict[str, str] = {
     # anthropic
     "claude": "anthropic",
     "claude-code": "anthropic",
+
+    # Gemini Code Assist OAuth (not the AI Studio api-key provider)
+    "google-gemini-cli": "gemini-oauth",
+    "gemini-code-assist": "gemini-oauth",
+    "gca": "gemini-oauth",
 
     # github-copilot (models.dev ID)
     "copilot": "github-copilot",
