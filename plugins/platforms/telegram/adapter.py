@@ -20,7 +20,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +690,11 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_FAST_DELAY_S = 0.18
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
+    # After a flush, drop a second identical body from the same session
+    # within this window. Telegram clients can emit two updates ~250ms
+    # apart (double Enter); raising the 0.18s batch delay would lag every
+    # short message, so dedup happens after the flush instead.
+    _TEXT_DEDUP_WINDOW_S = 1.0
 
     @staticmethod
     def _env_float_clamped(
@@ -795,6 +800,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._recent_text_dispatches: Dict[str, Tuple[str, float]] = {}
         self._drop_delayed_deliveries = False
         # Inbound events held across disconnect. PTB advances the polling offset
         # before our enqueue/flush drop-guard runs, so Telegram will not
@@ -9716,6 +9722,34 @@ class TelegramAdapter(BasePlatformAdapter):
     # Text message aggregation (handles Telegram client-side splits)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_inbound_text(text: Optional[str]) -> str:
+        """Strip all whitespace so '전화, 문자' and '전화,문자' still match."""
+        return "".join((text or "").split())
+
+    def _recent_dispatch_map(self) -> Dict[str, Tuple[str, float]]:
+        recent = getattr(self, "_recent_text_dispatches", None)
+        if recent is None:
+            recent = {}
+            self._recent_text_dispatches = recent
+        return recent
+
+    def _is_recent_duplicate_text(self, key: str, text: Optional[str]) -> bool:
+        norm = self._normalize_inbound_text(text)
+        if not norm:
+            return False
+        previous = self._recent_dispatch_map().get(key)
+        if not previous:
+            return False
+        prev_norm, prev_ts = previous
+        return prev_norm == norm and (time.monotonic() - prev_ts) < self._TEXT_DEDUP_WINDOW_S
+
+    def _remember_dispatched_text(self, key: str, text: Optional[str]) -> None:
+        norm = self._normalize_inbound_text(text)
+        if not norm:
+            return
+        self._recent_dispatch_map()[key] = (norm, time.monotonic())
+
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching.
 
@@ -9751,6 +9785,18 @@ class TelegramAdapter(BasePlatformAdapter):
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
+            same_body = (
+                self._normalize_inbound_text(event.text)
+                == self._normalize_inbound_text(existing.text)
+                and self._normalize_inbound_text(event.text)
+            )
+            if same_body and not event.media_urls:
+                logger.info(
+                    "[Telegram] Dropping duplicate inbound text for %s (%d chars)",
+                    key,
+                    chunk_len,
+                )
+                return
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
@@ -9808,10 +9854,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._hold_inbound_event(event, where="text-flush")
                 event = None
                 return
+            if self._is_recent_duplicate_text(key, event.text):
+                logger.info(
+                    "[Telegram] Dropping duplicate inbound text for %s (%d chars)",
+                    key,
+                    len(event.text or ""),
+                )
+                event = None
+                return
             logger.info(
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            self._remember_dispatched_text(key, event.text)
             await self.handle_message(event)
             event = None
         except asyncio.CancelledError:

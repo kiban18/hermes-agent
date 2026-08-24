@@ -7012,6 +7012,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # current stall episode (cleared when pending clears / activity resumes
         # / conversation boundary). See gateway.session_stall.
         self._session_stall_notified: Dict[str, bool] = {}
+        # Normalized user text of the currently running turn. Used to drop a
+        # Telegram double-send that arrives as a busy-mode follow-up.
+        self._in_flight_user_text: Dict[str, str] = {}
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -10053,9 +10056,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    @staticmethod
+    def _normalize_inbound_text(text: Optional[str]) -> str:
+        """Strip all whitespace so '전화, 문자' and '전화,문자' still match."""
+        return "".join((text or "").split())
+
+    def _in_flight_text_map(self) -> Dict[str, str]:
+        inflight = getattr(self, "_in_flight_user_text", None)
+        if inflight is None:
+            inflight = {}
+            self._in_flight_user_text = inflight
+        return inflight
+
+    def _remember_in_flight_user_text(self, session_key: str, text: Optional[str]) -> None:
+        if not session_key:
+            return
+        norm = self._normalize_inbound_text(text)
+        if not norm:
+            return
+        self._in_flight_text_map()[session_key] = norm
+
+    def _clear_in_flight_user_text(self, session_key: str) -> None:
+        if not session_key:
+            return
+        self._in_flight_text_map().pop(session_key, None)
+
+    def _same_normalized_text(self, left: Optional[str], right: Optional[str]) -> bool:
+        a = self._normalize_inbound_text(left)
+        b = self._normalize_inbound_text(right)
+        return bool(a) and a == b
+
+    def _is_duplicate_busy_followup(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any,
+    ) -> bool:
+        """True when this follow-up is the same text already in-flight or queued."""
+        if getattr(event, "message_type", None) != MessageType.TEXT:
+            return False
+        if getattr(event, "media_urls", None):
+            return False
+        if not self._normalize_inbound_text(getattr(event, "text", None)):
+            return False
+
+        in_flight = self._in_flight_text_map().get(session_key)
+        if self._same_normalized_text(in_flight, event.text):
+            return True
+
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if (
+            existing is not None
+            and getattr(existing, "message_type", None) == MessageType.TEXT
+            and not getattr(existing, "media_urls", None)
+            and self._same_normalized_text(getattr(existing, "text", None), event.text)
+        ):
+            return True
+
+        overflow = []
+        state = self._peek_session_state(session_key)
+        if state is not None:
+            overflow = list(state.conversation.queued_events or [])
+        for queued_event in overflow:
+            if (
+                getattr(queued_event, "message_type", None) == MessageType.TEXT
+                and not getattr(queued_event, "media_urls", None)
+                and self._same_normalized_text(getattr(queued_event, "text", None), event.text)
+            ):
+                return True
+        return False
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
+            return
+        if self._is_duplicate_busy_followup(session_key, event, adapter):
+            logger.info(
+                "Dropping duplicate busy-mode follow-up for session %s (%d chars)",
+                session_key,
+                len(event.text or ""),
+            )
             return
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
@@ -17080,14 +17161,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     if effective_busy_input_mode == "queue":
-                        self._enqueue_fifo(_quick_key, event, adapter)
+                        self._queue_or_replace_pending_event(_quick_key, event)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
+                        if self._is_duplicate_busy_followup(_quick_key, event, adapter):
+                            logger.info(
+                                "Dropping duplicate Telegram follow-up for session %s (%d chars)",
+                                _quick_key,
+                                len(event.text or ""),
+                            )
+                        else:
+                            merge_pending_message_event(
+                                adapter._pending_messages,
+                                _quick_key,
+                                event,
+                                merge_text=True,
+                            )
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -17103,12 +17191,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                    if self._is_duplicate_busy_followup(_quick_key, event, adapter):
+                        logger.info(
+                            "Dropping duplicate pending-start follow-up for session %s (%d chars)",
+                            _quick_key,
+                            len(event.text or ""),
+                        )
+                    else:
+                        merge_pending_message_event(
+                            adapter._pending_messages,
+                            _quick_key,
+                            event,
+                            merge_text=True,
+                        )
                 return None
             if self._draining:
                 queue_during_drain = self._queue_during_drain_enabled(
@@ -18808,6 +18903,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+        self._remember_in_flight_user_text(_quick_key, getattr(event, "text", None))
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -26427,6 +26523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
+        self._clear_in_flight_user_text(session_key)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
