@@ -261,7 +261,7 @@ ORGANIZATION_KANBAN_SCOPE_GUIDANCE = (
     "Managers must not replace subordinate reports with their own board scan. "
     "A generic manager-room question such as `칸반에 등록된 할 일이 있니?` is a "
     "team-wide status request: first report a separate `내 직접 할 일` section, "
-    "then run `/Users/khlee/.hermes/shared-skills/organization-board-operator/"
+    "then run `/Users/agent/.hermes/shared-skills/organization-board-operator/"
     "scripts/collect-subordinate-kanban-reports.sh <active-profile> --publish`. "
     "Use only the returned subordinate reports for a `하위 조직 보고` summary. "
     "The hierarchy is executive_coordinator → proposal_lead, project_lead, "

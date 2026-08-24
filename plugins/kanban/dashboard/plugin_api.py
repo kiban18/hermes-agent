@@ -250,6 +250,16 @@ def _task_dict(
         d["worker_model"] = last_run_model or task.model_override
     d["last_run_model"] = last_run_model
     d["worker_models"] = list(worker_models or [])
+    # Stable list-view aliases.  The task schema predates the dashboard table
+    # and calls these values ``created_by`` and ``assignee``.  Table clients
+    # use the user-facing names requester/worker; ship both spellings so those
+    # columns do not render blank while the canonical DB names stay intact.
+    d["requester"] = task.created_by
+    d["worker"] = task.assignee
+    # A task's effective AI is the resolved worker model (including the most
+    # recent fallback), not merely model_override.  Keep ``model`` as the
+    # compact table-field alias and retain worker_model(s) for rich clients.
+    d["model"] = d["worker_model"]
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -310,6 +320,7 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "summary": r.summary,
         "metadata": r.metadata,
         "error": r.error,
+        "model": r.model,
     }
 
 
@@ -3358,4 +3369,3 @@ def get_multi_board_state(
                 ).lower()
             ]
     return payload
-

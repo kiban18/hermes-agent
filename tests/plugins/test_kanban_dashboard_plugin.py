@@ -118,8 +118,37 @@ def test_create_task_appears_on_board(client):
     ready = next(c for c in data["columns"] if c["name"] == "ready")
     assert len(ready["tasks"]) == 1
     assert ready["tasks"][0]["id"] == task_id
+    # List/table clients use requester/worker/model while the database keeps
+    # the older created_by/assignee/worker_model names.  Both contracts must
+    # carry the same values rather than rendering empty cells.
+    listed = ready["tasks"][0]
+    assert listed["requester"] == listed["created_by"] == "dashboard"
+    assert listed["worker"] == listed["assignee"] == "researcher"
+    assert listed["model"] == listed["worker_model"]
     assert "acme" in data["tenants"]
     assert "researcher" not in data["assignees"]
+
+
+def test_run_endpoint_serializes_recorded_model(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="model-visible run", assignee="researcher",
+        )
+        now = int(time.time())
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, model) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, "researcher", "done", now, "model-visible"),
+        )
+        run_id = int(cur.lastrowid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.get(f"/api/plugins/kanban/runs/{run_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["run"]["model"] == "model-visible"
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):

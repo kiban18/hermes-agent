@@ -3235,7 +3235,7 @@ def representative_action_required(task: Task) -> bool:
 
 
 _ORG_CARD_IDENTITY = Path(
-    "/Users/khlee/.hermes/shared-skills/organization-board-operator/scripts/card-identity.py"
+    "/Users/agent/.hermes/shared-skills/organization-board-operator/scripts/card-identity.py"
 )
 
 

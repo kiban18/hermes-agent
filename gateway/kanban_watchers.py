@@ -278,7 +278,7 @@ def _find_project_name_for_task(task) -> Optional[str]:
         
     pid = pid_match.group(1)
     
-    pilots_path_str = os.environ.get("HERMES_PILOTS_DIR", "/Users/khlee/pilots")
+    pilots_path_str = os.environ.get("HERMES_PILOTS_DIR", "/Users/agent/pilots")
     pilots_dir = Path(pilots_path_str)
     if pilots_dir.exists():
         for p in pilots_dir.glob(f"wishket-pilot-{pid}-*"):
