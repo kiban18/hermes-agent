@@ -225,6 +225,25 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_no_agent_script_job_without_reasoning_pin(self, tmp_cron_dir):
+        job = create_job(
+            prompt=None,
+            schedule="every 1h",
+            script="payment-monitor.sh",
+            no_agent=True,
+            deliver="local",
+        )
+
+        assert job["script"] == "payment-monitor.sh"
+        assert job["no_agent"] is True
+        assert "reasoning_effort" not in job
+
+        fetched = get_job(job["id"])
+        assert fetched is not None
+        assert fetched["script"] == "payment-monitor.sh"
+        assert fetched["no_agent"] is True
+        assert "reasoning_effort" not in fetched
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")
