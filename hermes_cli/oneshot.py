@@ -398,6 +398,7 @@ def _run_agent(
     # the user's configured default provider, which may not host the model
     # the caller just asked for.
     effective_provider = (provider or "").strip() or None
+    pinned_provider = bool((provider or "").strip())
     explicit_base_url_from_alias: Optional[str] = None
     if effective_provider is None and (model or env_model):
         # Only auto-detect when the model was explicitly requested via arg or
@@ -443,7 +444,11 @@ def _run_agent(
     # sets; explicit values preserve user order.
     toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
-        toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+        if pinned_provider:
+            # Provider-pinned probes only need a single model turn.
+            toolsets_list = []
+        else:
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
@@ -452,12 +457,13 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    if not pinned_provider:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
-    )
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
@@ -468,10 +474,11 @@ def _run_agent(
     # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
     try:
-        # Read the effective fallback chain from profile config so oneshot
-        # workers honour the same merge semantics as interactive CLI and
-        # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        # Pinned ``--provider`` probes (auth status live check, kanban
+        # verification) must not inherit profile fallback — a 429 on Gemini
+        # would otherwise hang for minutes on cursor/composer before returning
+        # a provider mismatch instead of the real quota signal.
+        _fb = [] if pinned_provider else get_fallback_chain(cfg)
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),

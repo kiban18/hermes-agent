@@ -5,6 +5,9 @@ from hermes_cli.cli_output import line_input
 
 import json
 import math
+import os
+import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -557,7 +560,101 @@ def _default_live_model(provider: str) -> str:
     return ""
 
 
+def _gemini_quota_reset_seconds(error_message: str) -> float | None:
+    match = re.search(r"reset after (\d+)s", error_message or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_gemini_oauth_direct_live_probe(
+    model: str,
+    *,
+    timeout: float = 60.0,
+    max_attempts: int = 3,
+) -> dict:
+    """Lightweight live probe — avoids ``hermes -z`` agent/MCP startup hangs.
+
+    Uses the official ``gemini`` CLI (same OAuth store and Code Assist path)
+    instead of spawning a full Hermes oneshot worker or the in-process
+    CloudCode adapter, which can hit a separate short-lived 429 bucket.
+    """
+    provider = "gemini-oauth"
+    gemini_bin = shutil.which("gemini")
+    if not gemini_bin:
+        return {
+            "live_verified": False,
+            "usable": False,
+            "requested_model": model,
+            "actual_provider": provider,
+            "actual_model": model,
+            "live_error": "gemini CLI not found on PATH",
+        }
+
+    env = os.environ.copy()
+    env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+    command = [
+        gemini_bin,
+        "-m",
+        model,
+        "--skip-trust",
+        "-p",
+        "Reply with OK only.",
+    ]
+    last_detail = ""
+
+    for attempt in range(max_attempts):
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "live_verified": False,
+                "usable": False,
+                "requested_model": model,
+                "actual_provider": provider,
+                "actual_model": model,
+                "live_error": f"probe timed out after {int(timeout)} seconds",
+            }
+
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            report = {
+                "provider": provider,
+                "model": model,
+                "completed": True,
+                "failed": False,
+            }
+            return _usage_verification(provider, model, report, returncode=0)
+
+        last_detail = (proc.stderr or proc.stdout or "").strip()
+        wait_s = _gemini_quota_reset_seconds(last_detail)
+        if wait_s is not None and attempt < max_attempts - 1:
+            time.sleep(min(float(wait_s) + 0.5, 60.0))
+            continue
+        break
+
+    return {
+        "live_verified": False,
+        "usable": False,
+        "requested_model": model,
+        "actual_provider": provider,
+        "actual_model": model,
+        "live_error": (last_detail or "gemini CLI live probe failed")[-240:],
+    }
+
+
 def _run_provider_live_probe(provider: str, model: str) -> dict:
+    if provider.strip().lower() == "gemini-oauth":
+        return _run_gemini_oauth_direct_live_probe(model)
     with tempfile.TemporaryDirectory(prefix="hermes-auth-status-") as tmp:
         usage_path = Path(tmp) / "usage.json"
         hermes_script = Path(__file__).resolve().parent.parent / "hermes"

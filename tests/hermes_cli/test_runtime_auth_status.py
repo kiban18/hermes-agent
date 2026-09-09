@@ -83,6 +83,30 @@ def test_live_verification_rejects_fallback_provider():
     assert status["live_error"] == "provider mismatch: requested cursor, got xai"
 
 
+def test_gemini_oauth_live_probe_uses_gemini_cli(monkeypatch):
+    calls = {"run": 0}
+
+    def _fake_run(command, **kwargs):
+        calls["run"] += 1
+        return type(
+            "Proc",
+            (),
+            {"returncode": 0, "stdout": "OK\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("hermes_cli.auth_commands.shutil.which", lambda _: "/usr/bin/gemini")
+    monkeypatch.setattr("hermes_cli.auth_commands.subprocess.run", _fake_run)
+
+    from hermes_cli.auth_commands import _run_provider_live_probe
+
+    result = _run_provider_live_probe("gemini-oauth", "gemini-3.5-flash")
+
+    assert calls["run"] == 1
+    assert result["live_verified"] is True
+    assert result["actual_provider"] == "gemini-oauth"
+    assert result["actual_model"] == "gemini-3.5-flash"
+
+
 def test_live_verification_rejects_fallback_model():
     status = _usage_verification(
         "cursor",
