@@ -94,6 +94,16 @@ def test_strict_async_event_without_origin_chat_id_is_quarantined():
     assert runner._build_process_event_source(event) is None
 
 
+def test_legacy_telegram_group_async_event_without_envelope_is_quarantined():
+    runner = _runner()
+    event = {
+        "type": "async_delegation",
+        "session_key": "agent:main:telegram:group:-5272812362",
+    }
+
+    assert runner._build_process_event_source(event) is None
+
+
 @pytest.mark.asyncio
 async def test_injected_completion_carries_immutable_origin_metadata():
     adapter = SimpleNamespace(handle_message=AsyncMock())
