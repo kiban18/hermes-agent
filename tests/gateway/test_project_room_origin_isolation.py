@@ -9,6 +9,7 @@ import pytest
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 class _Entries:
@@ -131,3 +132,36 @@ def test_cross_room_completion_never_reaches_adapter_or_agent():
 
     assert result is None
     adapter.handle_message.assert_not_awaited()
+
+
+def test_background_process_completion_preserves_the_origin_envelope(tmp_path, monkeypatch):
+    import tools.process_registry as process_module
+
+    monkeypatch.setattr(process_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_origin",
+        command="true",
+        session_key="agent:main:telegram:group:-5272812362",
+        started_at=1.0,
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+        origin_envelope_version=1,
+        origin_chat_id="-5272812362",
+        origin_session_key="agent:main:telegram:group:-5272812362",
+        origin_profile="project_lead",
+        origin_board="wolgok",
+        origin_project="[프로젝트] 돌봄 키오스크",
+    )
+    registry._running[session.id] = session
+
+    registry._move_to_finished(session)
+
+    event = registry.completion_queue.get_nowait()
+    assert event["origin_envelope_version"] == 1
+    assert event["origin_chat_id"] == "-5272812362"
+    assert event["origin_session_key"] == session.session_key
+    assert event["origin_profile"] == "project_lead"
+    assert event["origin_board"] == "wolgok"
+    assert event["origin_project"] == "[프로젝트] 돌봄 키오스크"
