@@ -5884,6 +5884,7 @@ class TurnRunner:
         agent._gateway_turn_context_notes = "\n\n".join(
             self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         )
+        agent._gateway_event_metadata = dict(ctx.event_metadata or {})
 
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
@@ -20269,6 +20270,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                event_metadata=dict(event_metadata),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -25028,7 +25030,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
-        session_key = str(evt.get("session_key") or "").strip()
+        strict_origin = bool(evt.get("origin_envelope_version"))
+        origin_chat_id = str(evt.get("origin_chat_id") or "").strip()
+        origin_session_key = str(evt.get("origin_session_key") or "").strip()
+        legacy_session_key = str(evt.get("session_key") or "").strip()
+        legacy_route = _parse_session_key(legacy_session_key) if legacy_session_key else None
+        if (
+            not strict_origin
+            and evt.get("type") in {
+                "async_delegation", "completion", "watch_match", "watch_disabled"
+            }
+            and legacy_route
+            and legacy_route.get("platform") == "telegram"
+            and legacy_route.get("chat_type") in {"group", "forum", "supergroup"}
+        ):
+            logger.warning(
+                "Quarantining legacy Telegram group completion without an "
+                "immutable origin envelope: type=%s session=%r",
+                evt.get("type"), legacy_session_key,
+            )
+            return None
+        if strict_origin and (not origin_chat_id or not origin_session_key):
+            logger.warning(
+                "Quarantining synthetic event with incomplete origin envelope: "
+                "type=%s chat=%r session=%r",
+                evt.get("type", "?"), origin_chat_id, origin_session_key,
+            )
+            return None
+        if (
+            strict_origin
+            and legacy_session_key
+            and legacy_session_key != origin_session_key
+        ):
+            logger.warning(
+                "Quarantining synthetic event with conflicting session keys: "
+                "legacy=%r origin=%r",
+                legacy_session_key, origin_session_key,
+            )
+            return None
+        session_key = origin_session_key or legacy_session_key
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
@@ -25038,6 +25078,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
+                    if (
+                        strict_origin
+                        and str(getattr(entry.origin, "chat_id", "") or "")
+                        != origin_chat_id
+                    ):
+                        logger.warning(
+                            "Quarantining synthetic event: session-store chat=%r "
+                            "conflicts with origin chat=%r",
+                            getattr(entry.origin, "chat_id", ""), origin_chat_id,
+                        )
+                        return None
                     return entry.origin
             except Exception as exc:
                 logger.debug(
@@ -25048,6 +25099,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
+                if (
+                    strict_origin
+                    and str(getattr(cached_source, "chat_id", "") or "")
+                    != origin_chat_id
+                ):
+                    logger.warning(
+                        "Quarantining synthetic event: cached chat=%r conflicts "
+                        "with origin chat=%r",
+                        getattr(cached_source, "chat_id", ""), origin_chat_id,
+                    )
+                    return None
                 return cached_source
 
             _parsed = _parse_session_key(session_key)
@@ -25055,10 +25117,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                if strict_origin and derived_chat_id != origin_chat_id:
+                    logger.warning(
+                        "Quarantining synthetic event with chat/session mismatch: "
+                        "origin_chat=%r session_chat=%r",
+                        origin_chat_id, derived_chat_id,
+                    )
+                    return None
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
-        chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
+        explicit_chat_id = str(evt.get("chat_id") or "").strip()
+        if strict_origin and explicit_chat_id and explicit_chat_id != origin_chat_id:
+            logger.warning(
+                "Quarantining synthetic event with conflicting chat ids: "
+                "legacy=%r origin=%r",
+                explicit_chat_id, origin_chat_id,
+            )
+            return None
+        chat_id = str(origin_chat_id or explicit_chat_id or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
                 "Synthetic event source unresolvable: "
@@ -25147,6 +25224,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
+            if evt.get("origin_envelope_version"):
+                logger.warning(
+                    "Quarantining strict-origin completion before any fallback: "
+                    "type=%s origin_chat=%r",
+                    evt.get("type", "?"), evt.get("origin_chat_id"),
+                )
+                return None
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
             # structured ``agent:main:...`` key, so _build_process_event_source
@@ -25250,6 +25334,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            origin_session_key = str(
+                evt.get("origin_session_key") or evt.get("session_key") or ""
+            ).strip()
+            if evt.get("origin_envelope_version") and origin_session_key:
+                metadata["gateway_session_key"] = origin_session_key
+            for key in (
+                "origin_chat_id", "origin_profile", "origin_board",
+                "origin_project",
+            ):
+                value = evt.get(key)
+                if value:
+                    metadata[key] = value
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -25724,14 +25820,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expects. Best-effort: a CLI-origin event (empty session_key) is left
         as-is and simply won't route on the gateway.
         """
-        if evt.get("platform"):
+        strict_origin = bool(evt.get("origin_envelope_version"))
+        if evt.get("platform") and not strict_origin:
             return  # already enriched
-        parsed = _parse_session_key(evt.get("session_key", "") or "")
+        routing_key = (
+            evt.get("origin_session_key")
+            if strict_origin
+            else evt.get("session_key")
+        )
+        parsed = _parse_session_key(routing_key or "")
         if not parsed:
             return
         evt["platform"] = parsed.get("platform", "")
         evt["chat_type"] = parsed.get("chat_type", "")
-        evt["chat_id"] = parsed.get("chat_id", "")
+        evt["chat_id"] = (
+            evt.get("origin_chat_id")
+            if strict_origin
+            else parsed.get("chat_id", "")
+        )
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
@@ -25744,6 +25850,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the full gateway route. Events for different sessions never coalesce.
         """
         return tuple(str(evt.get(field) or "") for field in (
+            "origin_envelope_version",
+            "origin_session_key",
+            "origin_chat_id",
             "session_key",
             "parent_session_id",
             "platform",
@@ -26042,6 +26151,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             or ""
                         ),
                     }
+                    for key in (
+                        "origin_envelope_version", "origin_chat_id",
+                        "origin_session_key", "origin_profile", "origin_board",
+                        "origin_project",
+                    ):
+                        value = watcher.get(key) or getattr(session, key, None)
+                        if value:
+                            completion_evt[key] = value
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -27990,6 +28107,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        event_metadata: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28010,6 +28128,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                event_metadata=event_metadata,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28023,6 +28142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                event_metadata=event_metadata,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28166,6 +28286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        event_metadata: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28475,6 +28596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            event_metadata=dict(event_metadata or {}),
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

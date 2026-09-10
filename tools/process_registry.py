@@ -393,6 +393,12 @@ class ProcessSession:
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
+    origin_envelope_version: int = 0
+    origin_chat_id: str = ""
+    origin_session_key: str = ""
+    origin_profile: str = ""
+    origin_board: str = ""
+    origin_project: str = ""
     # Session-db id of the conversation that spawned this process. Lets the
     # gateway's completion pre-flight (_classify_completion_target) drop
     # notifications whose spawning session was closed at an explicit user
@@ -419,6 +425,18 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+
+
+def _origin_envelope(session: ProcessSession) -> Dict[str, Any]:
+    keys = (
+        "origin_envelope_version", "origin_chat_id", "origin_session_key",
+        "origin_profile", "origin_board", "origin_project",
+    )
+    return {
+        key: value
+        for key in keys
+        if (value := getattr(session, key, None))
+    }
 
 
 class ProcessRegistry:
@@ -614,6 +632,7 @@ class ProcessRegistry:
                         f"Falling back to notify_on_complete semantics; you'll get "
                         f"exactly one notification when the process exits."
                     ),
+                    **_origin_envelope(session),
                 })
             return
 
@@ -641,6 +660,7 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            **_origin_envelope(session),
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -1586,6 +1606,14 @@ class ProcessRegistry:
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
             }
+            for key in (
+                "origin_envelope_version", "origin_chat_id",
+                "origin_session_key", "origin_profile", "origin_board",
+                "origin_project",
+            ):
+                value = getattr(session, key, None)
+                if value:
+                    notification[key] = value
             _redact_process_result(notification)
             self.completion_queue.put(notification)
 
@@ -2572,6 +2600,12 @@ class ProcessRegistry:
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
+                            "origin_envelope_version": s.origin_envelope_version,
+                            "origin_chat_id": s.origin_chat_id,
+                            "origin_session_key": s.origin_session_key,
+                            "origin_profile": s.origin_profile,
+                            "origin_board": s.origin_board,
+                            "origin_project": s.origin_project,
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
@@ -2669,6 +2703,12 @@ class ProcessRegistry:
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
+                origin_envelope_version=entry.get("origin_envelope_version", 0),
+                origin_chat_id=entry.get("origin_chat_id", ""),
+                origin_session_key=entry.get("origin_session_key", ""),
+                origin_profile=entry.get("origin_profile", ""),
+                origin_board=entry.get("origin_board", ""),
+                origin_project=entry.get("origin_project", ""),
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
@@ -2692,6 +2732,12 @@ class ProcessRegistry:
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
+                    "origin_envelope_version": session.origin_envelope_version,
+                    "origin_chat_id": session.origin_chat_id,
+                    "origin_session_key": session.origin_session_key,
+                    "origin_profile": session.origin_profile,
+                    "origin_board": session.origin_board,
+                    "origin_project": session.origin_project,
                 })
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)

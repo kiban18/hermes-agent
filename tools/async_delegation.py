@@ -220,6 +220,27 @@ def _capture_routing_origin() -> Dict[str, Any]:
     try:
         from gateway.session_context import get_session_env
 
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if platform and chat_id and session_key:
+            origin.update(
+                {
+                    "origin_envelope_version": 1,
+                    "origin_chat_id": chat_id,
+                    "origin_session_key": session_key,
+                }
+            )
+            profile = get_session_env("HERMES_SESSION_PROFILE", "")
+            project = get_session_env("HERMES_SESSION_CHAT_NAME", "")
+            board = __import__("os").environ.get("HERMES_KANBAN_BOARD", "")
+            if profile:
+                origin["origin_profile"] = profile
+            if board:
+                origin["origin_board"] = board
+            if project:
+                origin["origin_project"] = project
+
         for evt_key, env_name in (
             ("scope_id", "HERMES_SESSION_SCOPE_ID"),
             ("user_id", "HERMES_SESSION_USER_ID"),
@@ -248,6 +269,8 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
             "scope_id", "user_id", "user_name",
+            "origin_envelope_version", "origin_chat_id", "origin_session_key",
+            "origin_profile", "origin_board", "origin_project",
         )
         if key in record
     }
@@ -375,7 +398,12 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in (
+                "scope_id", "user_id", "user_name",
+                "origin_envelope_version", "origin_chat_id",
+                "origin_session_key", "origin_profile", "origin_board",
+                "origin_project",
+            ):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -988,7 +1016,11 @@ def _push_completion_event(
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in (
+        "scope_id", "user_id", "user_name",
+        "origin_envelope_version", "origin_chat_id", "origin_session_key",
+        "origin_profile", "origin_board", "origin_project",
+    ):
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1202,7 +1234,11 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in (
+        "scope_id", "user_id", "user_name",
+        "origin_envelope_version", "origin_chat_id", "origin_session_key",
+        "origin_profile", "origin_board", "origin_project",
+    ):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

@@ -3347,6 +3347,19 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            if _gw_chat_id and session_key:
+                                proc_session.origin_envelope_version = 1
+                                proc_session.origin_chat_id = _gw_chat_id
+                                proc_session.origin_session_key = session_key
+                                proc_session.origin_profile = _gse(
+                                    "HERMES_SESSION_PROFILE", ""
+                                )
+                                proc_session.origin_board = os.environ.get(
+                                    "HERMES_KANBAN_BOARD", ""
+                                )
+                                proc_session.origin_project = _gse(
+                                    "HERMES_SESSION_CHAT_NAME", ""
+                                )
                             # Stamp the spawning conversation's session-db id
                             # so the gateway's completion pre-flight
                             # (_classify_completion_target) can drop the
@@ -3395,6 +3408,12 @@ def terminal_tool(
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
+                            "origin_envelope_version": proc_session.origin_envelope_version,
+                            "origin_chat_id": proc_session.origin_chat_id,
+                            "origin_session_key": proc_session.origin_session_key,
+                            "origin_profile": proc_session.origin_profile,
+                            "origin_board": proc_session.origin_board,
+                            "origin_project": proc_session.origin_project,
                         })
 
                 # Set watch patterns for output monitoring
