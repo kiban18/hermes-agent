@@ -111,6 +111,51 @@ async def test_injected_completion_carries_immutable_origin_metadata():
     assert injected.metadata["origin_project"] == "돌봄 키오스크"
 
 
+@pytest.mark.asyncio
+async def test_quarantine_cannot_fall_through_to_api_self_post(monkeypatch):
+    api_adapter = SimpleNamespace(handle_message=AsyncMock())
+    stale = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-5413942079",
+        chat_type="group",
+        user_id="representative",
+    )
+    runner = _runner(
+        entries={
+            "agent:main:telegram:group:-5272812362": SimpleNamespace(origin=stale)
+        }
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    self_posts = []
+
+    async def fake_deliver_wake(*args, **kwargs):
+        self_posts.append((args, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", fake_deliver_wake)
+    event = _strict_event(origin_session_id="raw-api-session")
+
+    result = await runner._inject_watch_notification("[IMPORTANT: done]", event)
+
+    assert result is None
+    assert self_posts == []
+
+
+def test_async_group_key_and_enrichment_use_immutable_origin():
+    runner = _runner()
+    first = _strict_event(chat_id="-5413942079", platform="telegram")
+    second = _strict_event(
+        origin_chat_id="-5338066929",
+        origin_session_key="agent:main:telegram:group:-5338066929",
+        chat_id="-5413942079",
+        platform="telegram",
+    )
+
+    runner._enrich_async_delegation_routing(first)
+
+    assert first["chat_id"] == "-5272812362"
+    assert runner._async_delegation_group_key(first) != runner._async_delegation_group_key(second)
+
+
 def test_cross_room_completion_never_reaches_adapter_or_agent():
     adapter = SimpleNamespace(handle_message=AsyncMock())
     stale = SessionSource(
