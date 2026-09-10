@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 import pytest
 
@@ -210,3 +211,25 @@ def test_background_process_completion_preserves_the_origin_envelope(tmp_path, m
     assert event["origin_profile"] == "project_lead"
     assert event["origin_board"] == "wolgok"
     assert event["origin_project"] == "[프로젝트] 돌봄 키오스크"
+
+
+def test_pre_llm_hook_receives_gateway_origin_metadata():
+    from tests.agent.test_api_content_sidecar import _FakeAgent, _build
+
+    agent = _FakeAgent()
+    agent._gateway_event_metadata = {
+        "origin_chat_id": "-5272812362",
+        "origin_profile": "project_lead",
+        "origin_board": "wolgok",
+        "origin_project": "[프로젝트] 돌봄 키오스크",
+    }
+    captured = {}
+
+    def invoke(_name, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=invoke):
+        _build(agent)
+
+    assert captured["extra"] == agent._gateway_event_metadata
