@@ -223,6 +223,38 @@ def test_background_process_completion_preserves_the_origin_envelope(tmp_path, m
     assert event["origin_project"] == "[프로젝트] 돌봄 키오스크"
 
 
+def test_background_process_watch_match_preserves_the_origin_envelope(
+    tmp_path, monkeypatch
+):
+    import tools.process_registry as process_module
+
+    monkeypatch.setattr(process_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_watch_origin",
+        command="server",
+        session_key="agent:main:telegram:group:-5272812362",
+        started_at=1.0,
+        watch_patterns=["READY"],
+        origin_envelope_version=1,
+        origin_chat_id="-5272812362",
+        origin_session_key="agent:main:telegram:group:-5272812362",
+        origin_profile="project_lead",
+        origin_board="wolgok",
+        origin_project="[프로젝트] 돌봄 키오스크",
+    )
+
+    registry._check_watch_patterns(session, "READY\n")
+
+    event = registry.completion_queue.get_nowait()
+    assert event["type"] == "watch_match"
+    assert event["origin_chat_id"] == "-5272812362"
+    assert event["origin_session_key"] == session.session_key
+    assert event["origin_profile"] == "project_lead"
+    assert event["origin_board"] == "wolgok"
+    assert event["origin_project"] == "[프로젝트] 돌봄 키오스크"
+
+
 def test_pre_llm_hook_receives_gateway_origin_metadata():
     from tests.agent.test_api_content_sidecar import _FakeAgent, _build
 
