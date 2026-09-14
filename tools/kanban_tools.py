@@ -1025,12 +1025,29 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
+            disputed = False
+            if not ok:
+                # The review run is already closed. A reviewer that kept
+                # looking and only then found the defect must still be able
+                # to say so — otherwise the verdict degrades to a comment
+                # nobody is notified about (worldvision t_57f88d63). Retract
+                # the completion this run wrote instead of dropping it.
+                task = kb.get_task(conn, tid)
+                if task is not None and task.status == "done":
+                    ok, detail = kb.dispute_completion(
+                        conn,
+                        tid,
+                        reason=reason,
+                        expected_run_id=run_id,
+                    )
+                    disputed = ok
             if not ok:
                 return tool_error(
                     f"could not request changes for {tid}: {detail or 'invalid review state'}"
@@ -1042,6 +1059,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "ready",
                 implementer=detail,
+                disputed_completion=disputed,
             )
         finally:
             conn.close()
@@ -2036,7 +2054,10 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column; use kanban_block only for a genuine external blocker. "
+        "If you already completed this task and then found a defect, call this "
+        "anyway: it retracts your completion and returns the card, so a late "
+        "finding is never lost."
     ),
     "parameters": {
         "type": "object",

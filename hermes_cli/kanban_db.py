@@ -7620,6 +7620,125 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def dispute_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Retract a ``done`` card because review found the work incomplete.
+
+    :func:`request_changes` is the in-review verdict and needs a live review
+    run; once :func:`complete_task` lands there is no run left to speak
+    through, so a reviewer that keeps looking and *then* finds the defect had
+    no way to say so — its verdict degraded to a comment nobody is notified
+    about (worldvision t_57f88d63, 2026-09-14: the card passed in 19s and the
+    real defect arrived 6 minutes later, unheard).
+
+    This is the retraction, not a rewind: the ``completed`` event stays in the
+    log and a ``completion_disputed`` event is appended after it, carrying the
+    reason that justifies reopening. The card returns to its implementer the
+    way :func:`reopen_review_task` does, and descendants that were built on
+    the retracted result are invalidated through the one shared done-reopen
+    implementation.
+
+    ``expected_run_id`` pins the retraction to the run that closed the card,
+    so a worker can withdraw its own verdict but not someone else's. Pass
+    ``None`` from CLI/orchestrator contexts, which are not run-scoped.
+
+    The second tuple item is the implementer on success or a diagnostic
+    reason on failure.
+    """
+    reason = str(redact_review_value(reason or "")).strip()
+    if not reason:
+        return False, "reason is required"
+
+    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None:
+            return False, "task not found"
+        if task_row["status"] != "done":
+            # ``archived`` is deliberately excluded: it is the irreversible
+            # status the notify-subscription teardown keys on.
+            return False, f"task is not done (status={task_row['status']})"
+
+        if expected_run_id is not None:
+            closing_run = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? "
+                "ORDER BY started_at DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if closing_run is None or int(closing_run["id"]) != int(expected_run_id):
+                return False, "run_id mismatch"
+
+        requested_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            handoff = (
+                json.loads(requested_event["payload"])
+                if requested_event and requested_event["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            handoff = {}
+        if not isinstance(handoff, dict):
+            handoff = {}
+        implementer = handoff.get("implementer")
+        if not isinstance(implementer, str) or not implementer.strip():
+            implementer = None
+        reviewer = handoff.get("reviewer")
+        if not isinstance(reviewer, str) or not reviewer.strip():
+            reviewer = None
+
+        new_status = _landing_status_after_parents(conn, task_id)
+        assignee_sql = ", assignee = ?" if implementer else ""
+        params: tuple[Any, ...] = (
+            (new_status, implementer, task_id)
+            if implementer
+            else (new_status, task_id)
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL"
+            # consecutive_failures deliberately PRESERVED, as in
+            # reopen_review_task: retracting a result is not a success.
+            + assignee_sql
+            + " WHERE id = ? AND status = 'done'",
+            params,
+        )
+        if cur.rowcount != 1:
+            return False, "task left done before the dispute landed"
+
+        payload: dict[str, Any] = {"status": new_status, "reason": reason}
+        if implementer:
+            payload["implementer"] = implementer
+        if reviewer:
+            payload["reviewer"] = reviewer
+        _append_event(conn, task_id, "completion_disputed", payload)
+
+        # Descendants that were promoted on the strength of this result are
+        # standing on a retracted premise — route through the one shared
+        # done-reopen implementation so this verb inherits its semantics.
+        result = invalidate_descendants_for_parent_reopen(
+            conn, task_id, author=reviewer or "review",
+        )
+        terminations.extend(result["terminations"])
+
+    for pid, claim_lock in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock)
+    recompute_ready(conn)
+    return True, implementer
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     task_id: str,

@@ -39,7 +39,9 @@ _PROGRESS_EVENT_KINDS = frozenset({
 # done" judgment and the defect text behind it, and dropping them leaves the
 # project room with only the earlier "[완료] 통과". They notify like the
 # ``review_requested`` handoff that opened the review.
-_REWORK_EVENT_KINDS = frozenset({"changes_requested", "review_reopened"})
+_REWORK_EVENT_KINDS = frozenset({
+    "changes_requested", "completion_disputed", "review_reopened",
+})
 _PROGRESS_NOTIFY_SKIP_STATUSES = frozenset({
     "todo", "ready", "running", "scheduled",
 })
@@ -360,7 +362,8 @@ class GatewayKanbanWatchersMixin:
         TERMINAL_KINDS = (
             "assigned", "blocked", "block_loop_detected", "changes_requested",
             "claimed", "completed", "completion_blocked_approval_owner",
-            "completion_blocked_representative_approval", "created", "crashed", "decomposed",
+            "completion_blocked_representative_approval", "completion_disputed",
+            "created", "crashed", "decomposed",
             "dependency_wait",
             "gave_up", "promoted", "promoted_manual", "reclaimed",
             "reconciled", "review_reopened", "review_requested", "scheduled", "specified",
@@ -766,11 +769,11 @@ class GatewayKanbanWatchersMixin:
                                     implementer = str(ev.payload["implementer"])
                             if reason_text:
                                 wake_handoff = reason_text[:400]
-                            state_label = (
-                                "수정 반환"
-                                if kind == "changes_requested"
-                                else "검수 재개"
-                            )
+                            state_label = {
+                                "changes_requested": "수정 반환",
+                                "completion_disputed": "완료 철회",
+                                "review_reopened": "검수 재개",
+                            }[kind]
                             msg = (
                                 f"[결정 필요] {sub['task_id']} · {title}"
                                 f"\n상태: {state_label}"

@@ -98,3 +98,47 @@ def test_review_reopen_reaches_the_room(tmp_path, monkeypatch):
     reopened = [text for text in messages if "검수 재개" in text]
     assert reopened, messages
     assert reopened[0].startswith("[결정 필요]")
+
+
+def test_disputed_completion_reaches_the_room_with_its_reason(tmp_path, monkeypatch):
+    """The t_57f88d63 shape: pass, then find the defect, then retract."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "dispute.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = _task_in_review(conn, reviewer="qa")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        review_claim = kb.claim_review_task(conn, tid)
+        assert review_claim is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="판정: 통과",
+            expected_run_id=review_claim.current_run_id,
+        )
+        ok, _ = kb.dispute_completion(
+            conn,
+            tid,
+            reason="QA-BHW-02 — 375×812에서 Print 버튼이 viewport 밖에 남음",
+            expected_run_id=review_claim.current_run_id,
+        )
+        assert ok
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    messages = [item["text"] for item in adapter.sent]
+    # The premature pass is still reported — the log is append-only — but the
+    # retraction reaches the same room right behind it.
+    assert any(text.startswith("[완료]") for text in messages)
+    retraction = [text for text in messages if "QA-BHW-02" in text]
+    assert retraction, messages
+    assert retraction[0].startswith("[결정 필요]")
+    assert "완료 철회" in retraction[0]
+    assert messages.index(retraction[0]) > next(
+        i for i, text in enumerate(messages) if text.startswith("[완료]")
+    )
