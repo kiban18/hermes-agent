@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
 
@@ -92,6 +93,62 @@ def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
     if arg_to and arg_to.strip():
         return arg_to.strip()
     return None
+
+
+def _usage_report_footer(path: str) -> str:
+    """Format caller-supplied measured usage without inferring missing work.
+
+    The standalone sender has no model turn of its own. A producer must pass
+    the actual usage record explicitly; validation prevents malformed totals
+    or a crafted label from changing the surrounding Telegram message.
+    """
+    from gateway.runtime_footer import format_api_equivalent_cost, format_turn_token_breakdown
+
+    try:
+        report_path = Path(path)
+        if report_path.stat().st_size > 65_536:
+            raise ValueError("file exceeds 64 KiB")
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict) or not isinstance(report.get("tokens"), dict):
+            raise ValueError("tokens object is required")
+        keys = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        tokens = {}
+        for key in keys:
+            value = report["tokens"].get(key, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{key} must be a non-negative integer")
+            tokens[key] = value
+        if not any(tokens.values()):
+            raise ValueError("at least one measured token is required")
+
+        def label(value: object, name: str) -> str:
+            if not isinstance(value, str) or not value.strip() or len(value) > 100:
+                raise ValueError(f"{name} must be a short string")
+            if len(value.splitlines()) != 1 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+                raise ValueError(f"{name} must be a single line")
+            return value.strip()
+
+        parts = []
+        if "profile" in report:
+            parts.append(label(report["profile"], "profile"))
+        models = report.get("models", [])
+        if not isinstance(models, list) or len(models) > 10:
+            raise ValueError("models must be a list of at most 10 names")
+        if models:
+            parts.append(" + ".join(label(model, "model").rsplit("/", 1)[-1] for model in models))
+        parts.append(format_turn_token_breakdown(tokens))
+        cost_text = report.get("api_equivalent_cost_usd")
+        if cost_text is not None:
+            cost = Decimal(str(cost_text))
+            if not cost.is_finite() or cost < 0:
+                raise ValueError("api_equivalent_cost_usd must be finite and non-negative")
+            cost_text = str(cost)
+        parts.append(format_api_equivalent_cost(cost_text))
+        if "source" in report:
+            parts.append(f"출처 {label(report['source'], 'source')}")
+        return "AI: " + " · ".join(parts)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, InvalidOperation) as exc:
+        raise ValueError(f"invalid usage report: {exc}") from exc
 
 
 def _emit_result(
@@ -371,6 +428,15 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    usage_report = getattr(args, "usage_report", None)
+    if usage_report:
+        try:
+            footer = _usage_report_footer(usage_report)
+        except ValueError as exc:
+            print(f"hermes send: {exc}", file=sys.stderr)
+            sys.exit(_USAGE_EXIT)
+        message = f"{message.rstrip()}\n\n{footer}"
+
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
     from tools.send_message_tool import send_message_tool
@@ -417,6 +483,7 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "  hermes send --to telegram \"deploy finished\"\n"
             "  echo \"RAM 92%\" | hermes send --to telegram:-1001234567890\n"
             "  hermes send --to discord:#ops --file /tmp/report.md\n"
+            "  hermes send --to telegram --file report.txt --usage-report usage.json\n"
             "  hermes send --to slack:#eng --subject \"[CI]\" --file build.log\n"
             "  hermes send --to telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
             "  hermes send --list                  # all platforms\n"
@@ -468,6 +535,17 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         metavar="LINE",
         default=None,
         help="Prepend a subject/header line before the message body.",
+    )
+    parser.add_argument(
+        "--usage-report",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Append AI usage from a JSON report with tokens "
+            "(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens), "
+            "optional profile/models/api_equivalent_cost_usd/source. "
+            "The sender does not infer earlier work."
+        ),
     )
 
     parser.add_argument(

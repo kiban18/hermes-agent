@@ -195,6 +195,84 @@ def test_register_send_subparser_is_reusable():
     assert args.message == "hi"
 
 
+def test_send_appends_supplied_usage_report(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    report = tmp_path / "usage.json"
+    report.write_text(json.dumps({
+        "profile": "project_qa",
+        "models": ["xai/grok-4.6", "anthropic/claude-sonnet-4-6"],
+        "tokens": {"input_tokens": 12, "output_tokens": 34,
+                   "cache_read_tokens": 56, "cache_write_tokens": 78},
+        "api_equivalent_cost_usd": "0.125",
+        "source": "kanban:t_a0b2df89",
+    }))
+    args = _parse(["--to", "telegram:-5515742264", "--usage-report", str(report), "Done"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    body = fake_tool.calls[0]["message"]
+    assert body.startswith("Done\n\nAI: project_qa · grok-4.6 + claude-sonnet-4-6")
+    assert "비캐시 입력 12 · 비캐시 출력 34 · 캐시 읽기 입력 56 · 캐시 저장 입력 78" in body
+    assert "API 환산 약 $0.1250" in body
+    assert "출처 kanban:t_a0b2df89" in body
+
+
+def test_send_without_usage_report_preserves_message(fake_tool, monkeypatch):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram", "Status"]))
+    assert exc.value.code == 0
+    assert fake_tool.calls[0]["message"] == "Status"
+
+
+def test_send_file_and_subject_append_usage_without_cost(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    body_file = tmp_path / "message.txt"
+    body_file.write_text("QA pending\n")
+    report = tmp_path / "usage.json"
+    report.write_text(json.dumps({"tokens": {"output_tokens": 42}}))
+    args = _parse(["--to", "telegram", "--file", str(body_file),
+                   "--subject", "[보고]", "--usage-report", str(report)])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    assert fake_tool.calls[0]["message"] == (
+        "[보고]\n\nQA pending\n\nAI: 비캐시 입력 0 · 비캐시 출력 42 · "
+        "캐시 읽기 입력 0 · 캐시 저장 입력 0 · API 환산 미확인"
+    )
+
+
+@pytest.mark.parametrize("payload", [
+    "not json",
+    json.dumps({"tokens": {"input_tokens": -1}}),
+    json.dumps({"tokens": {"input_tokens": 2.5}}),
+    json.dumps({"tokens": {"input_tokens": 2}, "api_equivalent_cost_usd": "nan"}),
+    json.dumps({"tokens": {"input_tokens": 2}, "models": ["good", "bad\nspoof"]}),
+    json.dumps({"tokens": {"input_tokens": 2}, "profile": "  "}),
+    json.dumps({"tokens": {"input_tokens": 2}, "source": "row\u2028spoof"}),
+])
+def test_bad_usage_report_blocks_delivery(fake_tool, monkeypatch, tmp_path, payload, capsys):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    report = tmp_path / "usage.json"
+    report.write_text(payload)
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram", "--usage-report", str(report), "Status"]))
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    assert "usage report" in capsys.readouterr().err.lower()
+
+
+def test_usage_report_requires_actual_usage_not_zero_fabrication(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    report = tmp_path / "usage.json"
+    report.write_text(json.dumps({"tokens": {"input_tokens": 0, "output_tokens": 0,
+                                             "cache_read_tokens": 0, "cache_write_tokens": 0}}))
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram", "--usage-report", str(report), "Status"]))
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+
+
 # ---------------------------------------------------------------------------
 # Env loader
 # ---------------------------------------------------------------------------
