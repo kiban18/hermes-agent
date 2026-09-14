@@ -484,6 +484,46 @@ def neutralize_untrusted_inline_text(value: Any, *, max_chars: int = _MAX_PROMPT
     return text
 
 
+_ROOM_KANBAN_SCRIPT = (
+    "/Users/agent/.hermes/shared-skills/organization-board-operator/"
+    "scripts/room-kanban.py"
+)
+_board_for_room_fn = None
+
+
+def _board_for_chat_name(chat_name: str, chat_type: str) -> "str | None":
+    """Resolve the kanban board a work room owns, or None.
+
+    The mapping already exists — ``board_for_room`` in the organization board
+    operator skill knows PIDs, aliases and the board catalog — but nothing on
+    the agent side consulted it, so every profile read the single board
+    hardcoded into its system prompt and treated every other room's work as
+    somebody else's (worldvision, 2026-09-15).
+
+    Returning None for an unmapped room is the contract, not a gap: the
+    upstream helper documents "None = do not guess", and guessing the
+    org-wide board is precisely how that bug happened.
+    """
+    global _board_for_room_fn
+    if chat_type not in ("group", "channel", "thread"):
+        return None
+    name = (chat_name or "").strip()
+    if not name:
+        return None
+    if _board_for_room_fn is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_hermes_room_kanban", _ROOM_KANBAN_SCRIPT
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _board_for_room_fn = module.board_for_room
+    return _board_for_room_fn(name)
+
+
 def build_session_context_prompt(
     context: SessionContext,
     *,
@@ -551,6 +591,24 @@ def build_session_context_prompt(
             desc = src.description
         lines.append(
             f"**Source:** {platform_name} ({_format_untrusted_prompt_value(desc)})"
+        )
+
+    # The board this room owns. Without it a profile falls back to whatever
+    # single board its static guidance names, and answers work in any other
+    # room with "not this room's remit" — including the room that owns it.
+    try:
+        _room_board = _board_for_chat_name(
+            context.source.chat_name or "", context.source.chat_type
+        )
+    except Exception:
+        # The registry lives outside this repo; a broken one must never cost
+        # the user a turn.
+        _room_board = None
+    if _room_board:
+        lines.append(
+            f"**Kanban Board:** `{_room_board}` — this room's own board. Work "
+            f"raised here belongs to it; use `--board {_room_board}` and do "
+            f"not treat it as another room's remit."
         )
 
     # Channel topic (if available - provides context about the channel's purpose)
