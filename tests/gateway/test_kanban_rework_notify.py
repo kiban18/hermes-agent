@@ -19,8 +19,14 @@ from tests.gateway.test_kanban_notifier import (
 )
 
 
-def _task_in_review(conn, *, reviewer="reviewer"):
-    tid = kb.create_task(conn, title="rework verdict", assignee="worker")
+def _task_in_review(conn, *, reviewer="reviewer", workspace=None):
+    tid = kb.create_task(
+        conn,
+        title="rework verdict",
+        assignee="worker",
+        **({"workspace_kind": "dir", "workspace_path": str(workspace)}
+           if workspace else {}),
+    )
     claimed = kb.claim_task(conn, tid)
     assert claimed is not None
     assert kb.request_review(
@@ -105,16 +111,28 @@ def test_disputed_completion_reaches_the_room_with_its_reason(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "dispute.db"))
     kb.init_db()
 
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     conn = kb.connect()
     try:
-        tid = _task_in_review(conn, reviewer="qa")
+        tid = _task_in_review(conn, reviewer="qa", workspace=workspace)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         review_claim = kb.claim_review_task(conn, tid)
         assert review_claim is not None
+        # A pass that clears the evidence gate and is still wrong.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at - ? "
+                "WHERE task_id = ? AND kind = 'claimed'",
+                (kb.REVIEW_EVIDENCE_MIN_SECONDS + 60, tid),
+            )
+        shot = workspace / "bhw-375x812.png"
+        shot.write_bytes(b"\x89PNG evidence")
         assert kb.complete_task(
             conn,
             tid,
             summary="판정: 통과",
+            metadata={"artifacts": [str(shot)]},
             expected_run_id=review_claim.current_run_id,
         )
         ok, _ = kb.dispute_completion(

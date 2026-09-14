@@ -21,6 +21,8 @@ def reviewer_env(monkeypatch, tmp_path):
 
     home = tmp_path / ".hermes"
     home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "project_qa")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -30,7 +32,11 @@ def reviewer_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="print button visible", assignee="project_developer"
+            conn,
+            title="print button visible",
+            assignee="project_developer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -42,10 +48,22 @@ def reviewer_env(monkeypatch, tmp_path):
         )
         review_claim = kb.claim_review_task(conn, tid)
         assert review_claim is not None
+        # Clear the evidence gate the way a real pass must: a file in the
+        # workspace and time on the clock. The verdict is still wrong — that
+        # is exactly the case retraction exists for.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at - ? "
+                "WHERE task_id = ? AND kind = 'claimed'",
+                (kb.REVIEW_EVIDENCE_MIN_SECONDS + 60, tid),
+            )
+        shot = workspace / "bhw-375x812.png"
+        shot.write_bytes(b"\x89PNG evidence")
         assert kb.complete_task(
             conn,
             tid,
             summary="판정: 통과",
+            metadata={"artifacts": [str(shot)]},
             expected_run_id=review_claim.current_run_id,
         )
         run_id = review_claim.current_run_id

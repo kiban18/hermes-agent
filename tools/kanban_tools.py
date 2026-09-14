@@ -795,6 +795,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.ReviewEvidenceRequiredError as evidence_err:
+                # Structured rejection — the card was NOT mutated (the gate
+                # runs before the write txn), so the worker can attach the
+                # evidence and call kanban_complete again. Name the other
+                # legitimate exit too: a reviewer who cannot produce evidence
+                # of the accepted behaviour has not established a pass, and
+                # kanban_request_changes is the honest verdict.
+                return tool_error(
+                    f"{evidence_err} Your task is still in-flight. Re-run the "
+                    f"check, pass the file(s) you produced as "
+                    f"artifacts=[...], and call kanban_complete again — or, if "
+                    f"the behaviour does not hold, call kanban_request_changes "
+                    f"with what you found."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

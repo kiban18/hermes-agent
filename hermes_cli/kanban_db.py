@@ -5860,6 +5860,155 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class ReviewEvidenceRequiredError(RuntimeError):
+    """Raised when a review verdict closes a card without usable evidence."""
+
+    def __init__(self, task_id: str, problems: list[str]):
+        self.task_id = task_id
+        self.problems = problems
+        super().__init__(
+            f"completion blocked: a review verdict on {task_id} needs evidence. "
+            + " ".join(problems)
+        )
+
+
+# A headed browser check of a real user path does not finish in seconds. The
+# measured rubber-stamp pattern on the worldvision board was 7-30s between the
+# review claim and the pass; nine of 48 verdicts landed under a minute. This is
+# a floor on elapsed time, not a proxy for effort — it is trivially waited out,
+# and it exists only to stop the instant pass, not to price the work.
+REVIEW_EVIDENCE_MIN_SECONDS = 120
+
+# Evidence is hashed so a later pass can detect the same file being re-declared
+# across cards; anything larger is refused rather than silently skipped.
+REVIEW_EVIDENCE_MAX_BYTES = KANBAN_ATTACHMENT_MAX_BYTES
+
+
+def _review_claim_started_at(
+    conn: sqlite3.Connection, task_id: str, run_id: int
+) -> Optional[int]:
+    """When the reviewer claimed this run, per its own ``claimed`` event."""
+    row = conn.execute(
+        "SELECT created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    return int(row["created_at"]) if row else None
+
+
+def _review_evidence_check(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    expected_run_id: Optional[int],
+    now: int,
+) -> Optional[tuple[list[str], list[dict]]]:
+    """Check a review verdict's evidence.
+
+    Returns ``None`` when the gate does not apply, otherwise
+    ``(problems, records)``: a non-empty ``problems`` list refuses the
+    completion, and ``records`` are the verified per-file entries stamped onto
+    the completion so a later pass can spot the same file re-declared
+    elsewhere.
+
+    Scope is deliberately narrow. Only a run *claimed from review* is gated:
+    an implementer hands off through ``request_review`` rather than closing
+    its own card, and a person approving a card parked in the review lane has
+    no active run at all — that person IS the check this gate stands in for.
+
+    The file rules close the hole that made a declared artifact meaningless:
+    :func:`_persist_scratch_completion_artifacts` validates nothing unless the
+    workspace is managed scratch, and even then it waves through any path that
+    resolves outside the workspace root. So a reviewer could declare
+    ``/tmp/anything.png`` — or a path to nothing at all — and the completion
+    stood. Evidence must exist, be a non-empty regular file, and live in the
+    task's own workspace.
+    """
+    run_id = expected_run_id
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        run_id = row["current_run_id"] if row else None
+    if run_id is None:
+        return None
+    if _retry_status_for_run(conn, task_id, run_id) != "review":
+        return None
+
+    problems: list[str] = []
+
+    claimed_at = _review_claim_started_at(conn, task_id, int(run_id))
+    if claimed_at is not None and (now - claimed_at) < REVIEW_EVIDENCE_MIN_SECONDS:
+        problems.append(
+            f"This review ran for {max(now - claimed_at, 0)}s; a verdict needs at "
+            f"least {REVIEW_EVIDENCE_MIN_SECONDS}s of actual checking."
+        )
+
+    row = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    workspace_root: Optional[Path] = None
+    if row and row["workspace_path"]:
+        try:
+            workspace_root = Path(row["workspace_path"]).expanduser().resolve()
+        except OSError:
+            workspace_root = None
+
+    raw = (metadata or {}).get("artifacts")
+    candidates = [raw] if isinstance(raw, str) else raw
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+
+    records: list[dict] = []
+    rejected: list[str] = []
+    for item in candidates:
+        declared = str(item).strip() if isinstance(item, str) else ""
+        if not declared:
+            continue
+        try:
+            resolved = Path(declared).expanduser().resolve()
+        except OSError:
+            rejected.append(f"{declared} (unreadable path)")
+            continue
+        if workspace_root is not None and not resolved.is_relative_to(workspace_root):
+            rejected.append(f"{declared} (outside the task workspace)")
+            continue
+        if not resolved.is_file():
+            rejected.append(f"{declared} (missing or not a regular file)")
+            continue
+        size = resolved.stat().st_size
+        if size == 0:
+            rejected.append(f"{declared} (empty)")
+            continue
+        if size > REVIEW_EVIDENCE_MAX_BYTES:
+            rejected.append(f"{declared} (over {REVIEW_EVIDENCE_MAX_BYTES} bytes)")
+            continue
+        digest = hashlib.sha256()
+        try:
+            with resolved.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            rejected.append(f"{declared} ({exc})")
+            continue
+        records.append(
+            {"path": str(resolved), "size": size, "sha256": digest.hexdigest()}
+        )
+
+    if not records:
+        detail = f" Rejected: {'; '.join(rejected)}." if rejected else ""
+        problems.append(
+            "Attach at least one file that shows the accepted behaviour at the "
+            "viewport or interface the card names — a headed screenshot, an E2E "
+            "trace, a test log — inside the task workspace, and pass it as "
+            f"artifacts.{detail}"
+        )
+
+    return problems, records
+
+
 class ApprovalOwnerRequiredError(ValueError):
     """Raised when a profile tries to complete another owner's approval."""
 
@@ -6040,6 +6189,32 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Gate: a review verdict must carry evidence. Same shape as the
+    # created_cards gate above — the refusal gets its own tiny txn so it is
+    # auditable, then raises without mutating task state.
+    review_check = _review_evidence_check(
+        conn, task_id, metadata, expected_run_id=expected_run_id, now=now,
+    )
+    if review_check is not None and not review_check[0]:
+        metadata = dict(metadata or {})
+        metadata["review_evidence"] = review_check[1]
+    elif review_check is not None:
+        problems = review_check[0]
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_review_evidence",
+                {
+                    "problems": problems,
+                    "summary_preview": (
+                        (summary or result or "").strip().splitlines()[0][:200]
+                        if (summary or result)
+                        else None
+                    ),
+                },
+            )
+        raise ReviewEvidenceRequiredError(task_id, problems)
+
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered

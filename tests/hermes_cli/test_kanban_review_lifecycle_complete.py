@@ -68,7 +68,28 @@ def _claimed_review(
     return task_id, review
 
 
-def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
+def _clear_review_evidence_gate(conn, task_id: str, tmp_path: Path) -> Path:
+    """Satisfy the review-evidence gate so a lifecycle test can approve.
+
+    This file asserts block-loop accounting across review cycles, not the
+    evidence policy (see test_kanban_review_evidence_gate.py) — but a review
+    verdict now has to carry evidence and time, so the approval step supplies
+    both.
+    """
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET created_at = created_at - ? "
+            "WHERE task_id = ? AND kind = 'claimed'",
+            (kb.REVIEW_EVIDENCE_MIN_SECONDS + 60, task_id),
+        )
+    evidence = tmp_path / f"{task_id}-verification.log"
+    evidence.write_text("independent verification output\n", encoding="utf-8")
+    return evidence
+
+
+def test_same_card_review_supports_changes_and_approval_without_block_loop(
+    conn, tmp_path: Path
+):
     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
@@ -136,10 +157,12 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     review_run = kb.latest_run(conn, task_id)
     assert review_run is not None
     assert review_run.profile == "reviewer"
+    evidence = _clear_review_evidence_gate(conn, task_id, tmp_path)
     assert kb.complete_task(
         conn,
         task_id,
         summary="Approved after independent verification.",
+        metadata={"artifacts": [str(evidence)]},
         expected_run_id=review_2.current_run_id,
     )
 
