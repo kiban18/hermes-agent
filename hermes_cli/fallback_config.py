@@ -86,6 +86,11 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     The returned list always contains fresh dict copies.
     """
 
+    from hermes_cli.task_fallback_config import read_task_fallback_override
+    task_override = read_task_fallback_override()
+    if task_override is not None:
+        return task_override
+
     config = config or {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()

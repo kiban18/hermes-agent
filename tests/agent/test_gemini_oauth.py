@@ -40,6 +40,25 @@ class GeminiOauthTests(unittest.TestCase):
             _needs_refresh({"access_token": "ya29.x", "expiry_date": 9_999_999_999_000})
         )
 
+    def test_resolve_code_assist_project_prefers_gemini_cli_env(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOGLE_CLOUD_PROJECT": "sapient-office-455912-e7",
+                "GOOGLE_CLOUD_PROJECT_ID": "sapient-office-455912-e7",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                gemini_oauth,
+                "_project_from_gemini_cli_env",
+                return_value="numeric-habitat-487420-i6",
+            ):
+                self.assertEqual(
+                    gemini_oauth.resolve_code_assist_project(),
+                    "numeric-habitat-487420-i6",
+                )
+
     def test_oauth_client_credentials_come_from_protected_scope(self):
         values = {
             "GEMINI_CLI_CLIENT_ID": "client-id",

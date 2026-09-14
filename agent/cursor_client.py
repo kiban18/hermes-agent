@@ -44,6 +44,49 @@ _TOOL_CALL_JSON_RE = re.compile(
 )
 
 
+def _acp_server_request_result(method_name: str, params: Any) -> dict[str, Any]:
+    """Answer Cursor ACP server→client requests without cancelling the handshake.
+
+    Official clients return allow-once for ``session/request_permission``.
+    A blanket ``cancelled`` on every inbound request can make ``session/new``
+    fail with Internal error after CLI updates that ask during setup.
+    """
+    if method_name == "session/request_permission":
+        option_id = "allow-once"
+        if isinstance(params, dict):
+            options = params.get("options") or []
+            if isinstance(options, list):
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    kind = str(option.get("kind") or "")
+                    oid = option.get("optionId") or option.get("id")
+                    if kind in {"allow_once", "allow-once"} and isinstance(oid, str) and oid:
+                        option_id = oid
+                        break
+                    if isinstance(oid, str) and oid and option_id == "allow-once":
+                        option_id = oid
+        return {"outcome": {"outcome": "selected", "optionId": option_id}}
+    if method_name == "cursor/create_plan":
+        return {"outcome": {"outcome": "accepted"}}
+    if method_name == "cursor/ask_question":
+        return {"outcome": {"outcome": "skipped", "reason": "hermes-noninteractive"}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
+def _is_retryable_acp_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "session/new failed",
+            "internal error",
+            "process exited early",
+            "did not return a sessionid",
+        )
+    )
+
+
 def _resolve_cursor_bin() -> str:
     env_bin = os.getenv("CURSOR_AGENT_BIN", "").strip()
     if env_bin:
@@ -464,6 +507,9 @@ class CursorClient:
                     errors="replace",
                     bufsize=1,
                     env=_build_subprocess_env(self.api_key),
+                    # ACP's host process must not inherit an ephemeral task
+                    # cwd. The actual task directory is supplied to session/new.
+                    cwd=_resolve_home_dir(),
                     creationflags=windows_hide_flags(),
                 )
             except FileNotFoundError as exc:
@@ -500,7 +546,10 @@ class CursorClient:
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": False, "writeTextFile": False},
+                        "terminal": False,
+                    },
                     "clientInfo": {
                         "name": "hermes-agent",
                         "title": "Hermes Agent",
@@ -510,6 +559,10 @@ class CursorClient:
                 timeout_seconds=30.0,
                 process=proc,
             )
+            # Headless Hermes already injects CURSOR_API_KEY. Official
+            # authenticate{methodId:cursor_login} waits for a browser and
+            # times out the gateway. CLI docs: pre-auth via API key, then
+            # session/new. Keep permission replies (not blanket cancel).
             return proc
 
     def _request(
@@ -550,12 +603,10 @@ class CursorClient:
                     text_parts.append(str(content.get("text") or ""))
                 continue
             if isinstance(method_name, str) and "id" in message:
-                # Hermes supplies tools through its prompt protocol; Cursor's
-                # own filesystem/shell permissions stay closed.
                 process.stdin.write(json.dumps({
                     "jsonrpc": "2.0",
                     "id": message.get("id"),
-                    "result": {"outcome": {"outcome": "cancelled"}},
+                    "result": _acp_server_request_result(method_name, message.get("params")),
                 }) + "\n")
                 process.stdin.flush()
                 continue
@@ -563,7 +614,11 @@ class CursorClient:
                 continue
             if "error" in message:
                 error = message.get("error") or {}
-                raise RuntimeError(f"Cursor ACP {method} failed: {error.get('message') or error}")
+                detail = "\n".join(self._stderr_tail).strip()
+                suffix = f" | stderr: {detail}" if detail else ""
+                raise RuntimeError(
+                    f"Cursor ACP {method} failed: {error.get('message') or error}{suffix}"
+                )
             return message.get("result")
         raise TimeoutError(f"Timed out waiting for Cursor ACP response to {method}.")
 
@@ -639,33 +694,51 @@ class CursorClient:
     ) -> tuple[str, int, int]:
         # ACP is a single stdio stream, so serialize calls on this client while
         # retaining the process between calls.
+        last_error: Exception | None = None
         with self._request_lock:
             self._cancel_idle_timer()
             try:
-                proc = self._start_process(model)
-                session = self._request(
-                    "session/new",
-                    {"cwd": os.getcwd(), "mcpServers": []},
-                    timeout_seconds=min(timeout_seconds, 30.0),
-                    process=proc,
-                ) or {}
-                session_id = str(session.get("sessionId") or "").strip()
-                if not session_id:
-                    raise RuntimeError("Cursor ACP did not return a sessionId.")
-                text_parts: list[str] = []
-                self._request(
-                    "session/prompt",
-                    {
-                        "sessionId": session_id,
-                        "prompt": [{"type": "text", "text": prompt_text}],
-                    },
-                    timeout_seconds=timeout_seconds,
-                    process=proc,
-                    text_parts=text_parts,
-                )
-                return "".join(text_parts).strip(), 0, 0
+                for attempt in range(2):
+                    try:
+                        try:
+                            session_cwd = os.getcwd()
+                        except FileNotFoundError as exc:
+                            raise ValueError(
+                                "Cursor task workspace no longer exists. Restore the "
+                                "workspace or restart this task from its valid workspace; "
+                                "refusing to run tools in an unrelated directory."
+                            ) from exc
+                        proc = self._start_process(model)
+                        session = self._request(
+                            "session/new",
+                            {"cwd": session_cwd, "mcpServers": []},
+                            timeout_seconds=min(timeout_seconds, 30.0),
+                            process=proc,
+                        ) or {}
+                        session_id = str(session.get("sessionId") or "").strip()
+                        if not session_id:
+                            raise RuntimeError("Cursor ACP did not return a sessionId.")
+                        text_parts: list[str] = []
+                        self._request(
+                            "session/prompt",
+                            {
+                                "sessionId": session_id,
+                                "prompt": [{"type": "text", "text": prompt_text}],
+                            },
+                            timeout_seconds=timeout_seconds,
+                            process=proc,
+                            text_parts=text_parts,
+                        )
+                        return "".join(text_parts).strip(), 0, 0
+                    except Exception as exc:
+                        last_error = exc
+                        self.close()
+                        if attempt == 0 and _is_retryable_acp_error(exc):
+                            continue
+                        raise
             finally:
                 self._schedule_idle_close()
+        raise last_error or RuntimeError("Cursor ACP prompt failed.")
 
 
 class AsyncCursorClient:

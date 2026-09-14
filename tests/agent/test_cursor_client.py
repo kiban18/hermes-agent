@@ -10,9 +10,11 @@ import agent.auxiliary_client as ac
 from agent.cursor_client import (
     AsyncCursorClient,
     CursorClient,
+    _acp_server_request_result,
     _extract_tool_calls_from_text,
     _format_messages_as_prompt,
     _build_subprocess_env,
+    _is_retryable_acp_error,
 )
 from agent.agent_runtime_helpers import create_openai_client
 
@@ -134,6 +136,17 @@ class TestCursorClient(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual(command, ["cursor-agent", "acp", "--model", "composer-2.5"])
         self.assertNotIn("cursor-test-key", command)
+        self.assertEqual(popen.call_args.kwargs["cwd"], _build_subprocess_env("cursor-test-key")["HOME"])
+
+    def test_deleted_workspace_does_not_start_or_retry_cursor(self):
+        client = CursorClient(idle_timeout_seconds=0)
+        with (
+            patch("agent.cursor_client.os.getcwd", side_effect=FileNotFoundError()),
+            patch.object(client, "_start_process") as start,
+        ):
+            with self.assertRaisesRegex(ValueError, "workspace no longer exists"):
+                client._run_prompt("hello", model="composer-2.5", timeout_seconds=10)
+        start.assert_not_called()
 
     def test_run_prompt_reuses_process_and_creates_fresh_sessions(self):
         client = CursorClient()
@@ -161,6 +174,43 @@ class TestCursorClient(unittest.TestCase):
         self.assertEqual(second[0], "reply-2")
         self.assertEqual(start.call_count, 2)
         self.assertEqual(session_number, 2)
+
+    def test_start_process_skips_browser_authenticate(self):
+        client = CursorClient(api_key="cursor-test-key", cursor_bin="cursor-agent")
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.stdin = MagicMock()
+        proc.stdout = []
+        proc.stderr = []
+        methods: list[str] = []
+        init_params: dict | None = None
+
+        def fake_request(method, params, **kwargs):
+            nonlocal init_params
+            methods.append(method)
+            if method == "initialize":
+                init_params = params
+            return {}
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch.object(client, "_request", side_effect=fake_request),
+        ):
+            self.assertIs(client._start_process("composer-2.5"), proc)
+        self.assertEqual(methods, ["initialize"])
+        self.assertIsNotNone(init_params)
+        self.assertIn("fs", init_params["clientCapabilities"])
+
+    def test_permission_request_allows_once(self):
+        result = _acp_server_request_result(
+            "session/request_permission",
+            {"options": [{"kind": "allow_once", "optionId": "allow-once"}]},
+        )
+        self.assertEqual(
+            result,
+            {"outcome": {"outcome": "selected", "optionId": "allow-once"}},
+        )
+        self.assertTrue(_is_retryable_acp_error(RuntimeError("Cursor ACP session/new failed: Internal error")))
 
     def test_idle_process_is_closed(self):
         client = CursorClient(idle_timeout_seconds=0.01)

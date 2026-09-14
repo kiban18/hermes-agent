@@ -45,23 +45,34 @@ def gemini_oauth_creds_path() -> Path:
     return Path.home() / ".gemini" / "oauth_creds.json"
 
 
+def _project_from_gemini_cli_env() -> str:
+    """Read the billed Code Assist project from the Gemini CLI store."""
+    env_path = Path.home() / ".gemini" / ".env"
+    if not env_path.is_file():
+        return ""
+    try:
+        for line in env_path.read_text().splitlines():
+            if line.startswith("GOOGLE_CLOUD_PROJECT=") or line.startswith(
+                "GOOGLE_CLOUD_PROJECT_ID="
+            ):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return value
+    except OSError:
+        pass
+    return ""
+
+
 def resolve_code_assist_project() -> str:
+    # Gemini CLI owns the OAuth billing project; profile-level
+    # GOOGLE_CLOUD_PROJECT may point at a different GCP project.
+    cli_project = _project_from_gemini_cli_env()
+    if cli_project:
+        return cli_project
     for key in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"):
         value = os.environ.get(key, "").strip()
         if value:
             return value
-    env_path = Path.home() / ".gemini" / ".env"
-    if env_path.is_file():
-        try:
-            for line in env_path.read_text().splitlines():
-                if line.startswith("GOOGLE_CLOUD_PROJECT=") or line.startswith(
-                    "GOOGLE_CLOUD_PROJECT_ID="
-                ):
-                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if value:
-                        return value
-        except OSError:
-            pass
     return DEFAULT_CLOUD_PROJECT
 
 
