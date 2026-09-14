@@ -576,6 +576,30 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
 
 
+def test_complete_task_defers_cleanup_until_workspace_process_exits(kanban_home):
+    import subprocess
+    import sys
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="workspace lifetime")
+        ws = kb.resolve_workspace(kb.get_task(conn, tid))
+        kb.set_workspace_path(conn, tid, ws)
+        child_dir = ws / "nested"
+        child_dir.mkdir()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            cwd=child_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            assert kb.complete_task(conn, tid, result="done")
+            assert ws.exists(), "completion must not delete a live worker's cwd"
+        finally:
+            proc.communicate(timeout=10)
+        kb.cleanup_finished_workspaces(conn)
+        assert not ws.exists(), "deferred cleanup must run after the worker exits"
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
@@ -1614,3 +1638,35 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_rewrite_host_workspace_path_maps_missing_worker_home():
+    import hermes_cli.kanban_db as _kb
+
+    if Path("/Users/khlee").exists():
+        pytest.skip("worker home exists on this host")
+    assert (
+        _kb.rewrite_host_workspace_path("/Users/khlee/work/ryoo8775/g2b-stats")
+        == "/Users/agent/work/ryoo8775/g2b-stats"
+    )
+    assert _kb.rewrite_host_workspace_path("/Users/agent/work/x") == "/Users/agent/work/x"
+    assert _kb.rewrite_host_workspace_path(None) is None
+
+
+def test_respawn_guard_does_not_treat_workspace_permission_denied_as_auth(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ws-perm", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/Users/khlee'", tid),
+        )
+        conn.commit()
+        assert _kb.check_respawn_guard(conn, tid) != "blocker_auth"
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("401 unauthorized", tid),
+        )
+        conn.commit()
+        assert _kb.check_respawn_guard(conn, tid) == "blocker_auth"

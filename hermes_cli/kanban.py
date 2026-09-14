@@ -385,6 +385,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument("--level", default=None, dest="routing_level",
+                          choices=["simple", "standard", "complex", "critical"],
+                          help="Task-model-routing level stored on the card. "
+                               "Dispatcher resolves the model at spawn. "
+                               "Default: standard. Use task_model_router.py "
+                               "create for extra-review cards.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -1601,6 +1607,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            routing_level=getattr(args, "routing_level", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -1971,7 +1978,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if model:
         label = f"{provider}:{model}" if provider else model
         print(f"Set model override on {args.task_id}: {label} "
-              "(applies on next dispatch)")
+              "(exception pin; applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
@@ -2297,7 +2304,12 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+    """Apply the goal judge to completion only.
+
+    ``request-review`` is how independent QA starts. Judging it against
+    acceptance criteria that include QA pass is circular and wedges the
+    card in triage (2026-09-09, pickclass ``t_a932fa6a``).
+    """
     if task is None or not task.goal_mode:
         return None
     try:
@@ -2360,9 +2372,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
+            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Complete
+            # still requires acceptance evidence. request-review does not —
+            # see _cmd_request_review.
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
@@ -2525,17 +2537,6 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
-            summary or "",
-        )
-        if rejection is not None:
-            print(
-                f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
-                file=sys.stderr,
-            )
-            return 1
         ok, reason = kb.request_review(
             conn,
             tid,

@@ -260,7 +260,11 @@ def _goal_judge_available() -> bool:
 
 
 def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+    """Return a rejection reason when a goal-mode *completion* is premature.
+
+    Do not call this from request-review. Independent QA is the missing
+    evidence; requiring it before handoff loops the card into triage.
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
     verdict = "done"
@@ -830,6 +834,26 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
+                row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                if row and row[0] in ("done", "archived"):
+                    # Idempotent protocol close: downstream review/QA may have
+                    # already terminalized the card while this worker catches up.
+                    if summary or result or metadata:
+                        kb.edit_completed_task_result(
+                            conn,
+                            tid,
+                            result=result,
+                            summary=summary,
+                            metadata=metadata,
+                        )
+                    run = kb.latest_run(conn, tid)
+                    return _ok(
+                        task_id=tid,
+                        run_id=run.id if run else None,
+                        idempotent=True,
+                    )
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
@@ -981,14 +1005,6 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
-            if rejection is not None:
-                return tool_error(
-                    f"Goal review handoff rejected by judge: {rejection}. "
-                    "Provide acceptance evidence matching the card before "
-                    "requesting review."
-                )
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
@@ -1474,6 +1490,12 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    routing_level = args.get("level")
+    extra_review = False
+    extra_review_arg, extra_review_error = _parse_bool_arg(args, "extra_review")
+    if extra_review_error:
+        return tool_error(extra_review_error)
+    extra_review = bool(extra_review_arg)
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1517,6 +1539,8 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                routing_level=routing_level,
+                extra_review=extra_review,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -2399,13 +2423,28 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "level": {
+                "type": "string",
+                "enum": ["simple", "standard", "complex", "critical"],
+                "description": (
+                    "Task-model-routing level. Dispatcher resolves the "
+                    "model from policies/task-model-routing.json at spawn. "
+                    "Default: standard. Do not pin model/provider unless "
+                    "this card is an explicit exception."
+                ),
+            },
+            "extra_review": {
+                "type": "boolean",
+                "description": (
+                    "If true, spawn uses the extra_review candidate chain "
+                    "instead of the assignee level grid."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": (
-                    "Pin the dispatched worker to this model instead of "
-                    "the assignee profile's configured model. Use the "
-                    "exact model name the target provider expects. Omit "
-                    "to use the profile default."
+                    "Exception-only pin. Omit so the dispatcher resolves "
+                    "the model at spawn from task-model-routing.json."
                 ),
             },
             "provider": {

@@ -134,6 +134,35 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_v2_runtime_resolves_live_policy(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "project_developer").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, *a, **k: captured.update(cmd=list(cmd)) or FakeProc())
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="project_developer")
+    task.body = (
+        '[task-runtime] {"version":2,"routing":{"profile":"project_developer",'
+        '"level":"standard","simple_verified":false}}\n\nwork'
+    )
+    task.model_override = None
+    kb._default_spawn(task, str(workspace))
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-m") + 1] == "glm-5.3"
+    assert cmd[cmd.index("--provider") + 1] == "zai"
+    assert cmd[cmd.index("--reasoning") + 1] == "high"
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

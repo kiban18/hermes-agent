@@ -235,9 +235,9 @@
   font-size: 0.62rem;
   padding: 0.05rem 0.35rem;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
-  color: var(--color-muted-foreground);
+  background: color-mix(in srgb, #4a8cd1 22%, transparent);
+  border: 1px solid color-mix(in srgb, #4a8cd1 80%, transparent);
+  color: #d1e3f6;
   letter-spacing: 0.02em;
 }
 .hermes-kanban-progress--full {

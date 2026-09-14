@@ -134,6 +134,27 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Mac mini Hermes host is ``/Users/agent``. Cards created on the worker
+# MacBook still bake ``/Users/khlee/{work,maintain,pilots,project}``.
+# mkdir on the missing home raises Permission denied, which used to match
+# the auth respawn guard and park the task forever.
+_WORKER_HOME = Path("/Users/khlee")
+_HOST_HOME = Path("/Users/agent")
+
+
+def rewrite_host_workspace_path(path: Optional[str]) -> Optional[str]:
+    """Map a dead worker-home workspace onto this host when that home is absent."""
+    if not path:
+        return path
+    raw = Path(path).expanduser()
+    try:
+        relative = raw.relative_to(_WORKER_HOME)
+    except ValueError:
+        return path
+    if _WORKER_HOME.exists():
+        return path
+    return str(_HOST_HOME / relative)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -3317,6 +3338,8 @@ def create_task(
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    routing_level: Optional[str] = None,
+    extra_review: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -3350,10 +3373,11 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
-    ``model_override`` / ``provider_override`` pin the worker to a specific
-    model (and optionally its provider) without touching the profile's
-    config — passed to the worker as ``-m <model> [--provider <name>]``.
-    ``provider_override`` requires ``model_override``.
+    ``model_override`` / ``provider_override`` are the exception pin
+    (``hermes kanban set-model``). New cards store level in ``[task-runtime]``
+    version 2 and the dispatcher resolves the model from
+    ``policies/task-model-routing.json`` at spawn. ``provider_override``
+    requires ``model_override``.
 
     ``reasoning_effort`` pins the worker's thinking depth for this task
     (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
@@ -3407,6 +3431,14 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    from hermes_cli.task_fallback_config import ensure_runtime_body
+    body = ensure_runtime_body(
+        body,
+        profile=assignee,
+        level=routing_level or "standard",
+        extra_review=bool(extra_review),
+    )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3592,6 +3624,10 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    workspace_path = rewrite_host_workspace_path(workspace_path)
+    if project_repo:
+        project_repo = rewrite_host_workspace_path(project_repo) or project_repo
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -6668,6 +6704,45 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _workspace_in_use(path: str) -> bool:
+    """A terminal card can still have workers finishing their last model turn.
+
+    Inspect actual process working directories, including descendants of the
+    workspace. Task completion clears claims before those processes exit, so
+    task status/worker_pid alone cannot establish that deletion is safe.
+    """
+    import psutil
+
+    workspace = Path(path).resolve()
+    for proc in psutil.process_iter():
+        try:
+            cwd = proc.cwd()
+            if cwd and Path(cwd).resolve().is_relative_to(workspace):
+                return True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied:
+            # Other users' processes cannot be inspected. Do not delete if an
+            # inaccessible process belongs to this worker's own account.
+            try:
+                if proc.username() == psutil.Process().username():
+                    return True
+            except psutil.Error:
+                continue
+    return False
+
+
+def cleanup_finished_workspaces(conn: sqlite3.Connection) -> None:
+    """Retry terminal workspace cleanup after workers have actually exited."""
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE status IN ('done', 'archived') "
+        "AND workspace_kind IN ('scratch', 'worktree') AND workspace_path IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        if Path(row['workspace_path']).is_dir():
+            _cleanup_workspace(conn, row['id'])
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -6708,6 +6783,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            return
+        if _workspace_in_use(path):
+            _log.debug("Deferring workspace cleanup for task %s: live process at %s", task_id, path)
             return
         if kind == "worktree":
             # Kill the (dead) tmux worker session BEFORE removing the
@@ -6843,7 +6921,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            # All children done — safe to clean up parent workspace
+            if _workspace_in_use(row["workspace_path"]):
+                continue
+            # All children done and no process still using the workspace.
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
                     parent_id, row["workspace_path"], row["branch_name"]
@@ -8785,6 +8865,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     so subsequent runs reuse the same directory.
     """
     kind = task.workspace_kind or "scratch"
+    if task.workspace_path:
+        rewritten = rewrite_host_workspace_path(task.workspace_path)
+        if rewritten != task.workspace_path:
+            task.workspace_path = rewritten
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
@@ -10434,8 +10518,11 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
+    # Workspace mkdir/path errors are stamped ``workspace: ...`` and may
+    # contain ``Permission denied``. Those are host-path problems, not
+    # provider auth — retry after the path is rewritten.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if err and not str(err).startswith("workspace:") and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -10884,6 +10971,8 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    cleanup_finished_workspaces(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -11801,19 +11890,8 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
-    # Per-task thinking depth. Independent of the model override — a task can
-    # run the profile's own model at a different depth — so this is its own
-    # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
+    from hermes_cli.task_fallback_config import worker_cli_model_flags
+    cmd.extend(worker_cli_model_flags(task))
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

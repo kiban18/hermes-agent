@@ -282,10 +282,13 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
-def test_goal_mode_review_handoff_cannot_bypass_judge(
+def test_goal_mode_request_review_skips_judge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """Independent QA starts with request-review. The goal judge must not
+    require QA-pass evidence before that handoff (2026-09-09 t_a932fa6a).
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -293,11 +296,15 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
+    def _fail_if_judged(*args, **kwargs):
+        raise AssertionError("request-review must not call the goal judge")
+
     with kb.connect() as conn:
         tool_task = kb.create_task(
             conn,
             title="Goal-mode tool task",
             assignee="builder",
+            body="완료 기준: project_qa 독립 QA 통과 증거",
             goal_mode=True,
         )
         claimed = kb.claim_task(conn, tool_task, claimer="builder:1")
@@ -308,31 +315,24 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     from tools import kanban_tools as tools
 
     monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
-    monkeypatch.setattr(
-        tools,
-        "judge_goal",
-        lambda *args, **kwargs: (
-            "continue",
-            "acceptance evidence is missing",
-            False,
-            None,
-            False,
-        ),
-    )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
-    assert "error" in rejected
-    assert "rejected by judge" in rejected["error"]
+    monkeypatch.setattr(tools, "judge_goal", _fail_if_judged)
+    requested = json.loads(tools._handle_request_review({
+        "summary": "구현·artifact 근거 통합. 독립 검수 요청.",
+        "reviewer": "project_qa",
+    }))
+    assert requested.get("ok") is True
     with kb.connect() as conn:
         tool_after = kb.get_task(conn, tool_task)
         assert tool_after is not None
-        assert tool_after.status == "running"
+        assert tool_after.status == "review"
+        assert tool_after.assignee == "project_qa"
 
-    # The shell/CLI path applies the same gate and must not bypass the tool.
     with kb.connect() as conn:
         cli_task = kb.create_task(
             conn,
             title="Goal-mode CLI task",
             assignee="builder",
+            body="완료 기준: project_qa 독립 QA 통과 증거",
             goal_mode=True,
         )
         cli_claimed = kb.claim_task(conn, cli_task, claimer="builder:2")
@@ -348,17 +348,17 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         "get_text_auxiliary_client",
         lambda purpose: (object(), "judge-model"),
     )
-    monkeypatch.setattr(
-        goals,
-        "judge_goal",
-        lambda *args, **kwargs: ("continue", "tests are missing", False, None, False),
+    monkeypatch.setattr(goals, "judge_goal", _fail_if_judged)
+    output = kc.run_slash(
+        f"request-review {cli_task} --summary 'Looks ready.' --reviewer project_qa"
     )
-    output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
-    assert "rejected by judge" in output
+    assert "rejected by judge" not in output
+    assert "Requested review" in output
     with kb.connect() as conn:
         cli_after = kb.get_task(conn, cli_task)
         assert cli_after is not None
-        assert cli_after.status == "running"
+        assert cli_after.status == "review"
+        assert cli_after.assignee == "project_qa"
 
 
 def test_goal_loop_stops_after_reviewer_requests_changes(
