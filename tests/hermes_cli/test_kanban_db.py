@@ -576,6 +576,30 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
 
 
+def test_complete_task_defers_cleanup_until_workspace_process_exits(kanban_home):
+    import subprocess
+    import sys
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="workspace lifetime")
+        ws = kb.resolve_workspace(kb.get_task(conn, tid))
+        kb.set_workspace_path(conn, tid, ws)
+        child_dir = ws / "nested"
+        child_dir.mkdir()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+            cwd=child_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            assert kb.complete_task(conn, tid, result="done")
+            assert ws.exists(), "completion must not delete a live worker's cwd"
+        finally:
+            proc.communicate(timeout=10)
+        kb.cleanup_finished_workspaces(conn)
+        assert not ws.exists(), "deferred cleanup must run after the worker exits"
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:

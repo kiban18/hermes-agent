@@ -6668,7 +6668,85 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _process_location_snapshot() -> tuple[list[Path], list[str]]:
+    """One pass over the process table: readable cwds, plus opaque cmdlines.
+
+    Taken once and reused across workspaces — the scan costs ~11ms against
+    ~600 processes, and :func:`cleanup_finished_workspaces` checks every
+    terminal card on each dispatcher tick.
+    """
+    import psutil
+
+    cwds: list[Path] = []
+    opaque: list[str] = []
+    for proc in psutil.process_iter():
+        try:
+            cwd = proc.cwd()
+            if cwd:
+                cwds.append(Path(cwd).resolve())
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied:
+            try:
+                opaque.append(" ".join(proc.cmdline() or ()))
+            except psutil.Error:
+                continue
+        except OSError:
+            continue
+    return cwds, opaque
+
+
+def _workspace_in_use(
+    path: str,
+    snapshot: Optional[tuple[list[Path], list[str]]] = None,
+) -> bool:
+    """A terminal card can still have workers finishing their last model turn.
+
+    Inspect actual process working directories, including descendants of the
+    workspace. Task completion clears claims before those processes exit, so
+    task status/worker_pid alone cannot establish that deletion is safe.
+    """
+    cwds, opaque = snapshot if snapshot is not None else _process_location_snapshot()
+    try:
+        workspace = Path(path).resolve()
+    except OSError:
+        return False
+    workspace_str = str(workspace)
+    for cwd in cwds:
+        if cwd.is_relative_to(workspace):
+            return True
+    # macOS refuses cwd for some of our own processes too, so "same user" is
+    # not evidence of anything: on this host 174 processes deny cwd, two of
+    # them ours, none inside any workspace. Treating that as in-use pinned
+    # EVERY workspace forever — the deferral never released. The command line
+    # is the one other signal we can still read.
+    return any(workspace_str in line for line in opaque)
+
+
+
+def cleanup_finished_workspaces(conn: sqlite3.Connection) -> None:
+    """Retry terminal workspace cleanup after workers have actually exited.
+
+    Runs on every dispatcher tick, so the process table is scanned once here
+    and reused for every candidate rather than once per workspace.
+    """
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE status IN ('done', 'archived') "
+        "AND workspace_kind IN ('scratch', 'worktree') AND workspace_path IS NOT NULL"
+    ).fetchall()
+    pending = [r for r in rows if Path(r["workspace_path"]).is_dir()]
+    if not pending:
+        return
+    snapshot = _process_location_snapshot()
+    for row in pending:
+        _cleanup_workspace(conn, row["id"], snapshot=snapshot)
+
+
+def _cleanup_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    snapshot: Optional[tuple[list[Path], list[str]]] = None,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
@@ -6708,6 +6786,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            return
+        if _workspace_in_use(path, snapshot):
+            _log.debug("Deferring workspace cleanup for task %s: live process at %s", task_id, path)
             return
         if kind == "worktree":
             # Kill the (dead) tmux worker session BEFORE removing the
@@ -6843,7 +6924,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            # All children done — safe to clean up parent workspace
+            if _workspace_in_use(row["workspace_path"]):
+                continue
+            # All children done and no process still using the workspace.
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
                     parent_id, row["workspace_path"], row["branch_name"]
@@ -10884,6 +10967,8 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    cleanup_finished_workspaces(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
