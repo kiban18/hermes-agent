@@ -1,10 +1,8 @@
-"""Standalone Telegram MEDIA:<path> caption delivery.
+"""Standalone Telegram MEDIA:<path> text and caption delivery.
 
-When `hermes send --to telegram "MEDIA:/x.png This Caption"` carries a single
-captionable file plus short text, the text must ride on the media bubble as the
-sendPhoto/sendVideo/sendDocument ``caption`` rather than being posted as a
-separate sendMessage beforehand. Longer text (> Telegram's 1024 caption cap)
-falls back to a separate message. The ``telegram`` package is stubbed.
+Photo/video text can ride on a visual media bubble. Document text stays in a
+normal-width sendMessage bubble before the document, even when short. The
+``telegram`` package is stubbed.
 """
 
 from __future__ import annotations
@@ -105,3 +103,41 @@ def test_multi_file_keeps_separate_text(monkeypatch: pytest.MonkeyPatch) -> None
     finally:
         os.unlink(img)
         os.unlink(img2)
+
+
+def test_document_keeps_normal_width_text_bubble(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.send_message_tool import _send_telegram
+
+    _no_proxy(monkeypatch)
+    bot = _make_bot()
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+    document = _tmpfile(".md")
+    try:
+        res = asyncio.run(
+            _send_telegram("tok", "123", "QA 결과와 첨부파일", media_files=[(document, False)])
+        )
+        assert res["success"] is True
+        bot.send_message.assert_awaited_once()
+        bot.send_document.assert_awaited_once()
+        assert not bot.send_document.await_args.kwargs.get("caption")
+    finally:
+        os.unlink(document)
+
+
+def test_forced_document_image_keeps_separate_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.send_message_tool import _send_telegram
+
+    _no_proxy(monkeypatch)
+    bot = _make_bot()
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+    image = _tmpfile(".png")
+    try:
+        res = asyncio.run(
+            _send_telegram("tok", "123", "Image as file", media_files=[(image, False)], force_document=True)
+        )
+        assert res["success"] is True
+        bot.send_message.assert_awaited_once()
+        bot.send_document.assert_awaited_once()
+        assert not bot.send_document.await_args.kwargs.get("caption")
+    finally:
+        os.unlink(image)

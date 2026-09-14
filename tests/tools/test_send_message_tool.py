@@ -1790,15 +1790,15 @@ class TestSendTelegramThreadNotFoundRetry:
     def test_disable_web_page_preview_not_leaked_to_media_sends(self):
         """disable_web_page_preview must never leak into a media send.
 
-        A single captionable file + short text now rides as the document's
-        caption (no separate text send), so the invariant to protect is that
-        the captioned send_document does not inherit disable_web_page_preview
-        (valid only for send_message).
+        Document text is sent separately so its bubble keeps normal width.
+        Only send_message may receive disable_web_page_preview.
         """
         media_kwargs_seen = []
+        text_kwargs_seen = []
 
         class FakeBot:
             async def send_message(self, **kwargs):
+                text_kwargs_seen.append(kwargs)
                 return SimpleNamespace(message_id=1)
 
             async def send_document(self, **kwargs):
@@ -1822,8 +1822,9 @@ class TestSendTelegramThreadNotFoundRetry:
 
             result = asyncio.run(run_test())
             assert result["success"] is True
-            # Caption rides the document bubble.
-            assert media_kwargs_seen[0].get("caption") == "check preview"
+            assert text_kwargs_seen[0]["text"] == "check preview"
+            assert text_kwargs_seen[0]["disable_web_page_preview"] is True
+            assert not media_kwargs_seen[0].get("caption")
             # Media send must NOT carry disable_web_page_preview.
             assert "disable_web_page_preview" not in media_kwargs_seen[0], \
                 "disable_web_page_preview leaked into send_document kwargs"

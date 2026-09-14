@@ -219,6 +219,11 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Adapter-selected group scope, independent of the sender used for auth.
+    # Keep it transport-local: untrusted wire payloads must not opt into a
+    # shared conversation. Persisted session keys already record the scope.
+    shared_session: bool = False
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -1062,6 +1067,8 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
+    if source.shared_session:
+        return True
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -1203,6 +1210,8 @@ def build_session_key(
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
     if effective_thread_id and not thread_sessions_per_user:
+        isolate_user = False
+    if source.shared_session:
         isolate_user = False
 
     if isolate_user and participant_id:

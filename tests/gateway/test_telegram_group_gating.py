@@ -1,5 +1,7 @@
 import asyncio
 import json
+import dataclasses
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -274,6 +276,76 @@ def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkey
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
 
     assert runner._is_user_authorized(source) is True
+
+
+@pytest.mark.parametrize("command", ["stop", "new"])
+@pytest.mark.parametrize("thread_id", [None, "7"])
+def test_observed_group_commands_control_the_shared_run(tmp_path, command, thread_id):
+    from gateway.config import GatewayConfig
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionStore, build_session_key
+
+    adapter = _make_adapter(
+        allowed_chats=["-100"], observe_unmentioned_group_messages=True,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="-100", chat_type="group",
+        user_id="111", user_name="Alice", thread_id=thread_id,
+    )
+    raw = _group_message("question", thread_id=thread_id)
+    normal = adapter._apply_telegram_group_observe_attribution(MessageEvent(
+        text="question", message_type=MessageType.TEXT, source=source,
+        raw_message=raw,
+    ))
+    control = adapter._apply_telegram_group_observe_attribution(MessageEvent(
+        text=f"/{command}", message_type=MessageType.COMMAND, source=source,
+        raw_message=raw,
+    ))
+    assert control.source.user_id == "111"
+    # Both adapter batching and the durable store must select the same run,
+    # even when ordinary group AND thread defaults isolate participants.
+    config = GatewayConfig(group_sessions_per_user=True, thread_sessions_per_user=True)
+    store = SessionStore(tmp_path / "sessions", config)
+    entry = store.get_or_create_session(normal.source)
+    key = entry.session_key
+    assert adapter._text_batch_key(control) == adapter._text_batch_key(normal)
+    assert store._generate_session_key(control.source) == key
+    assert build_session_key(dataclasses.replace(source, chat_id="-200")) != key
+
+    async def run():
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = store
+        agent = Mock()
+        runner._running_agents = {key: agent}
+        async def clear(actual_key, actual_source, **kwargs):
+            assert actual_key == key
+            assert actual_source.user_id == "111"
+            runner._running_agents.pop(actual_key).interrupt()
+        runner._interrupt_and_clear_session = AsyncMock(side_effect=clear)
+        if command == "stop":
+            await runner._handle_stop_command(control)
+            assert not runner._running_agents
+            agent.interrupt.assert_called_once()
+            assert store.get_or_create_session(normal.source).session_id == entry.session_id
+        else:
+            async def reset(event):
+                return store.reset_session(store._generate_session_key(event.source))
+            runner._handle_reset_command = AsyncMock(side_effect=reset)
+            replacement = await runner._busy_new_command(control, key, control.source)
+            assert not runner._running_agents
+            assert replacement.session_id != entry.session_id
+            assert store.get_or_create_session(normal.source).session_id == replacement.session_id
+    asyncio.run(run())
+
+
+def test_shared_scope_is_not_accepted_from_wire_or_applied_to_dm():
+    from gateway.session import build_session_key
+    dm = SessionSource(platform=Platform.TELEGRAM, chat_id="111", user_id="111")
+    assert build_session_key(dataclasses.replace(dm, shared_session=True)) == build_session_key(dm)
+    group = dataclasses.replace(dm, chat_type="group", shared_session=True)
+    assert "shared_session" not in group.to_dict()
+    assert not SessionSource.from_dict({**group.to_dict(), "shared_session": True}).shared_session
 
 
 class _FakeSessionEntry:

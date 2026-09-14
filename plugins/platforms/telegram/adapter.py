@@ -881,6 +881,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topic_chat_ids: Set[str] = {
             str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
         }
+        # Hot-reload mtime for group allowlists (allowed_chats, group_allowed_chats, …).
+        self._telegram_allowlist_config_mtime: Optional[float] = None
         # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
         # locally-hosted telegram-bot-api server (configured via extra.base_url)
         # raises that to 2GB, so the presence of base_url is the opt-in.
@@ -5461,6 +5463,17 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+                # Send-rate instrumentation (2026-09-08). The adapter logged
+                # only FAILURES, so an escalating Telegram flood-control
+                # penalty could not be traced back to an actual send rate:
+                # message timestamps in state.db are turn-end flush times,
+                # and platform_message_id is only populated for inbound
+                # messages. One line per delivered message — chat, chunk
+                # index/total (so splitting is visible), and length.
+                logger.info(
+                    "[%s] telegram_send_ok chat=%s msg_id=%s part=%d/%d len=%d",
+                    self.name, chat_id, msg.message_id, i + 1, len(chunks), len(chunk),
+                )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -9141,6 +9154,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             return False
 
+        self._maybe_reload_telegram_chat_allowlists()
+
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
@@ -9187,7 +9202,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        return dataclasses.replace(
+            source, user_id=None, user_name=None, user_id_alt=None,
+            shared_session=True,
+        )
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -9227,9 +9245,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # (user_id=None) causes admin-only commands like /new to be
             # denied even when the sender is an admin, because
             # SlashAccessPolicy.is_admin(None) is always False.
-            # Still inject channel_prompt for group context.
+            # Route to the same shared session as ordinary messages without
+            # losing that authenticated identity (not a separate per-user run).
             return dataclasses.replace(
                 event,
+                source=dataclasses.replace(event.source, shared_session=True),
                 channel_prompt=channel_prompt,
             )
         return dataclasses.replace(
@@ -9513,6 +9533,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not self._is_group_chat(message):
             return True
+
+        self._maybe_reload_telegram_chat_allowlists()
 
         thread_id = self._effective_message_thread_id(message)
         allowed_topics = self._telegram_allowed_topics()
@@ -10357,6 +10379,73 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"a sticker with emoji {emoji}" if emoji else "a sticker",
                 emoji, set_name,
             )
+
+    def _reload_telegram_chat_allowlists_from_config(self) -> None:
+        """Re-read group chat allowlists from config.yaml without a gateway restart.
+
+        Mirrors ``_reload_dm_topics_from_config``: new Telegram work rooms added
+        via ``sync-telegram-rooms.py`` become visible on the next group message
+        once ``config.yaml`` mtime advances.
+        """
+        try:
+            from hermes_cli.config import get_config_path, load_config_readonly
+
+            path = get_config_path()
+            self._telegram_allowlist_config_mtime = (
+                path.stat().st_mtime if path.is_file() else 0.0
+            )
+
+            config = load_config_readonly()
+            telegram_cfg = config.get("platforms", {}).get("telegram", {})
+            if not isinstance(telegram_cfg, dict):
+                return
+            extra_cfg = telegram_cfg.get("extra")
+            extra = extra_cfg if isinstance(extra_cfg, dict) else {}
+
+            old_group = self._telegram_group_allowed_chats()
+            updates: dict[str, Any] = {}
+            for key in (
+                "allowed_chats",
+                "group_allowed_chats",
+                "free_response_chats",
+                "free_response_topics",
+            ):
+                value = telegram_cfg.get(key)
+                if value is None:
+                    value = extra.get(key)
+                if value is not None:
+                    updates[key] = value
+
+            if not updates:
+                return
+
+            self.config.extra.update(updates)
+            added = self._telegram_group_allowed_chats() - old_group
+            if added:
+                logger.info(
+                    "[%s] Hot-loaded Telegram chat allowlists; new chats: %s",
+                    self.name,
+                    ", ".join(sorted(added)),
+                )
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to reload Telegram chat allowlists: %s", self.name, e
+            )
+
+    def _maybe_reload_telegram_chat_allowlists(self) -> None:
+        """Reload group allowlists when profile config.yaml is newer than cache."""
+        try:
+            from hermes_cli.config import get_config_path
+
+            path = get_config_path()
+            mtime = path.stat().st_mtime if path.is_file() else 0.0
+            if (
+                self._telegram_allowlist_config_mtime is None
+                or mtime > self._telegram_allowlist_config_mtime
+            ):
+                self._reload_telegram_chat_allowlists_from_config()
+        except Exception:
+            pass
 
     def _reload_dm_topics_from_config(self) -> None:
         """Re-read dm_topics from config.yaml and load any new thread_ids into cache.

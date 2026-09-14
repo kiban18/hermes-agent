@@ -1426,20 +1426,22 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         last_msg = None
         warnings = []
 
-        # MEDIA:<path> caption: when a single captionable file is accompanied
-        # by short text, attach the text to the media bubble as its native
-        # caption instead of sending it as a separate message beforehand
-        # (single enforced decision in _media_caption_split). Caption with the
-        # *formatted* text so MarkdownV2/HTML styling is preserved, but guard
-        # the formatted length against Telegram's 1024 cap — formatting can
-        # inflate a raw-<1024 string past it, in which case fall back to a
-        # separate body message.
+        # Telegram renders document captions inside a narrow document bubble.
+        # Keep prose beside a document as a normal-width text message; retain
+        # native captions for photos/videos, where the caption belongs to the
+        # visual. A force_document image follows the document rule.
         _tg_caption = None
         from gateway.platforms.base import utf16_len as _utf16_len
         _cap, _ = _media_caption_split(
             message, media_files, max_caption_len=_TELEGRAM_CAPTION_LIMIT
         )
-        if _cap is not None and _utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
+        _visual_media = False
+        if len(media_files) == 1:
+            _media_path, _ = media_files[0]
+            _media_ext = os.path.splitext(_media_path)[1].lower()
+            _visual_media = (_media_ext in _IMAGE_EXTS and not force_document) or _media_ext in _VIDEO_EXTS
+        if (_visual_media and _cap is not None
+                and _utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT):
             _tg_caption = formatted
             formatted = ""  # suppress the separate text send below
 
