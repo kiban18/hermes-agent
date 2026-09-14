@@ -27,12 +27,19 @@ logger = logging.getLogger("gateway.run")
 # Progress-template kinds that used to emit "[진행] Todo/Ready/…".
 # Humans only need [중단], [결정 필요], [완료], and 👤 Human cards.
 _PROGRESS_EVENT_KINDS = frozenset({
-    "assigned", "changes_requested", "claimed", "created",
+    "assigned", "claimed", "created",
     "decomposed", "dependency_wait", "promoted",
     "promoted_manual", "reclaimed", "reconciled",
-    "review_reopened", "scheduled", "specified", "status",
+    "scheduled", "specified", "status",
     "unblocked",
 })
+# Rework verdicts (``changes_requested`` / ``review_reopened``) land the card
+# back in ``ready``, which is exactly what the progress filter treats as a
+# noisy tick. They are not ticks: they carry independent review's "this is not
+# done" judgment and the defect text behind it, and dropping them leaves the
+# project room with only the earlier "[완료] 통과". They notify like the
+# ``review_requested`` handoff that opened the review.
+_REWORK_EVENT_KINDS = frozenset({"changes_requested", "review_reopened"})
 _PROGRESS_NOTIFY_SKIP_STATUSES = frozenset({
     "todo", "ready", "running", "scheduled",
 })
@@ -745,11 +752,39 @@ class GatewayKanbanWatchersMixin:
                                 f"\n원인: {reason_text[:160]}"
                                 "\n판단: 권한 내에서 승인하거나 직속 상위에 요청"
                             )
+                        elif kind in _REWORK_EVENT_KINDS:
+                            # Independent review sent the work back. The
+                            # reason is the whole point of the message, so
+                            # carry it the way review_requested carries its
+                            # summary instead of collapsing to a lane label.
+                            reason_text = ""
+                            implementer = ""
+                            if ev.payload:
+                                if ev.payload.get("reason"):
+                                    reason_text = str(ev.payload["reason"])
+                                if ev.payload.get("implementer"):
+                                    implementer = str(ev.payload["implementer"])
+                            if reason_text:
+                                wake_handoff = reason_text[:400]
+                            state_label = (
+                                "수정 반환"
+                                if kind == "changes_requested"
+                                else "검수 재개"
+                            )
+                            msg = (
+                                f"[결정 필요] {sub['task_id']} · {title}"
+                                f"\n상태: {state_label}"
+                            )
+                            if implementer:
+                                msg += f"\n담당: {implementer}"
+                            if reason_text:
+                                msg += f"\n사유: {reason_text[:400]}"
+                            msg += "\n판단: 수정 후 재검수 요청 또는 직속 상위 요청"
                         elif kind in {
-                            "assigned", "changes_requested", "claimed", "created",
+                            "assigned", "claimed", "created",
                             "decomposed", "dependency_wait", "promoted",
                             "promoted_manual", "reclaimed", "reconciled",
-                            "review_reopened", "scheduled", "specified", "status",
+                            "scheduled", "specified", "status",
                             "unblocked",
                         }:
                             status_by_kind = {
@@ -759,7 +794,6 @@ class GatewayKanbanWatchersMixin:
                                 "promoted": "ready",
                                 "promoted_manual": "ready",
                                 "reconciled": "ready",
-                                "review_reopened": "ready",
                                 "scheduled": "scheduled",
                                 "specified": "todo",
                                 "unblocked": "ready",
