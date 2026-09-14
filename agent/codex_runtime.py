@@ -199,6 +199,16 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+    try:
+        from agent.api_equivalent_cost import record_call_cost
+        record_call_cost(agent, canonical_usage, provider=agent.provider,
+                         model=agent.model, prompt_tokens=prompt_tokens)
+    except Exception:
+        logger.debug("Codex API-equivalent pricing failed", exc_info=True)
+        agent._api_equivalent_unknown_calls = (
+            getattr(agent, "_api_equivalent_unknown_calls", 0) + 1
+        )
+
     cost_result = estimate_usage_cost(
         agent.model,
         canonical_usage,

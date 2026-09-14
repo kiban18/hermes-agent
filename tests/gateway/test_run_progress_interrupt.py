@@ -8,6 +8,7 @@ of tool-progress bubbles for calls that were already parsed from the LLM
 response — making the interrupt feel ignored.
 """
 
+import asyncio
 import importlib
 import sys
 import time
@@ -73,6 +74,23 @@ class PreInterruptAgent:
         self.tool_progress_callback("tool.started", "web_search", "first search", {})
         time.sleep(0.35)  # let the drain loop process
         return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CostedAgent(PreInterruptAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        from decimal import Decimal
+        self.session_api_calls = 1
+        self.session_input_tokens = 10
+        self.session_output_tokens = 2
+        self._api_equivalent_cost_usd = Decimal("0.25")
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class EmptyCostedAgent(CostedAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        result = super().run_conversation(message, conversation_history, task_id)
+        result["final_response"] = ""
+        return result
 
 
 class InterruptedAgent:
@@ -202,6 +220,13 @@ async def test_baseline_non_interrupted_agent_renders_progress(monkeypatch, tmp_
         "baseline agent should render its tool-progress event — "
         "if this fails the test harness is broken, not the fix"
     )
+
+
+@pytest.mark.parametrize("agent_cls", [CostedAgent, EmptyCostedAgent])
+def test_run_agent_preserves_turn_cost_for_footer(monkeypatch, tmp_path, agent_cls):
+    _, result = asyncio.run(_run_once(monkeypatch, tmp_path, agent_cls, "sess-cost"))
+    assert result["turn_usage"]["input_tokens"] == 10
+    assert result["api_equivalent_cost_usd"] == "0.25"
 
 
 @pytest.mark.asyncio

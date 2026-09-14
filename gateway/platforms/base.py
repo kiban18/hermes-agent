@@ -6626,6 +6626,27 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    # Telegram's short usage footer is sent after the answer
+                    # so later causal work can edit this exact bubble.
+                    _usage_footer = getattr(event, "_runtime_footer_delivery", None)
+                    if (
+                        self.platform == Platform.TELEGRAM
+                        and _usage_footer
+                        and getattr(result, "success", False)
+                    ):
+                        try:
+                            _footer_text, _post_usage = _usage_footer
+                            _footer_result = await delivery_adapter.send(
+                                event.source.chat_id, _footer_text,
+                                metadata=_final_thread_metadata,
+                            )
+                            if _post_usage and _footer_result.success:
+                                _post_usage.bind(
+                                    delivery_adapter, event.source.chat_id,
+                                    _footer_result.message_id, _footer_text,
+                                )
+                        except Exception:
+                            logger.debug("Editable usage footer delivery failed", exc_info=True)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (

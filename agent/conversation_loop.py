@@ -4193,6 +4193,31 @@ def run_conversation(
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )
+                    if getattr(agent, "_usage_probe_enabled", False):
+                        try:
+                            from hermes_constants import get_hermes_home
+                            from agent.usage_probe import append_model_call_usage
+
+                            append_model_call_usage(
+                                home=get_hermes_home(),
+                                turn_id=getattr(agent, "_usage_probe_turn_id", "") or "",
+                                session_id=agent.session_id or "",
+                                phase=getattr(agent, "_usage_probe_phase", "asis"),
+                                profile=getattr(agent, "_usage_probe_profile", ""),
+                                model=agent.model or "",
+                                provider=agent.provider or "",
+                                call_index=api_call_count,
+                                prompt_tokens=prompt_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                input_tokens=canonical_usage.input_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                duration_seconds=api_duration,
+                                messages=api_messages,
+                                tools=tools_for_api or [],
+                            )
+                        except Exception as probe_error:
+                            logger.debug("Model-call usage probe failed: %s", probe_error)
 
                     # On the MoA path, agent.model/provider are the virtual
                     # preset name ("closed") and "moa", which have no pricing
@@ -4210,6 +4235,24 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
+                    try:
+                        from agent.api_equivalent_cost import record_call_cost
+                        record_call_cost(
+                            agent, aggregator_usage, provider=_agg_cost_provider,
+                            model=_agg_cost_model,
+                            prompt_tokens=aggregator_usage.prompt_tokens,
+                        )
+                        if _moa_ref_cost is not None:
+                            # Advisor prices cannot be inferred from the
+                            # aggregator's model; withhold a partial total.
+                            agent._api_equivalent_unknown_calls = (
+                                getattr(agent, "_api_equivalent_unknown_calls", 0) + 1
+                            )
+                    except Exception as price_error:
+                        logger.debug("API-equivalent pricing failed: %s", price_error)
+                        agent._api_equivalent_unknown_calls = (
+                            getattr(agent, "_api_equivalent_unknown_calls", 0) + 1
+                        )
                     cost_result = estimate_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,

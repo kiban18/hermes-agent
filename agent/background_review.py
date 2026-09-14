@@ -83,6 +83,9 @@ def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
             return None
 
     run = _BackgroundReviewRun()
+    # Capture the originating turn's callback before a cached parent agent is
+    # reused for another message. A late review must edit its own reply.
+    run.usage_callback = getattr(agent, "background_review_usage_callback", None)
     try:
         with lock:
             current = getattr(agent, "_background_review_run", None)
@@ -900,6 +903,8 @@ def _snapshot_review_usage(review_agent: Any) -> Dict[str, Any]:
         ),
         "api_calls": int(getattr(review_agent, "session_api_calls", 0) or 0),
         "estimated_cost_usd": getattr(review_agent, "session_estimated_cost_usd", None),
+        "api_equivalent_cost_usd": str(getattr(review_agent, "_api_equivalent_cost_usd", 0) or 0),
+        "api_equivalent_unknown_calls": int(getattr(review_agent, "_api_equivalent_unknown_calls", 0) or 0),
     }
 
 
@@ -960,6 +965,27 @@ def _record_review_usage_to_parent(
             estimated_cost_usd=usage.get("estimated_cost_usd"),
             api_call_count=api_calls,
         )
+        # Keep each fork separate in the local, content-free turn ledger.
+        # session_model_usage aggregates repeated forks by model and cannot
+        # attribute their cost to an individual reply or evaluation phase.
+        try:
+            from gateway.turn_usage_ledger import append_turn_usage, usage_phase_from_home
+
+            home = session_db.db_path.parent
+            append_turn_usage(
+                home=home,
+                session_id=session_id,
+                source="auxiliary",
+                profile=home.name,
+                model=usage.get("model"),
+                usage=usage,
+                failed=False,
+                elapsed_seconds=None,
+                phase=usage_phase_from_home(home),
+                task="background_review",
+            )
+        except Exception as e:
+            logger.debug("Background review turn ledger write failed (non-fatal): %s", e)
     except Exception as e:
         logger.debug(
             "Background review usage recording failed (non-fatal): %s", e
@@ -1368,6 +1394,12 @@ def _run_review_in_thread(
                 if review_agent is not None:
                     review_usage.update(_snapshot_review_usage(review_agent))
                     _record_review_usage_to_parent(agent, review_usage)
+                    _usage_cb = getattr(review_run, "usage_callback", None)
+                    if _usage_cb:
+                        try:
+                            _usage_cb("background_review", review_usage)
+                        except Exception:
+                            logger.debug("Background review usage callback failed", exc_info=True)
                 # Publish completion as soon as the provider-capable phase has
                 # returned or startup cancellation has fenced it out.
                 _finish_request_phase(review_agent)

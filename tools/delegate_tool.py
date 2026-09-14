@@ -3121,6 +3121,12 @@ def _run_single_child(
                 )
                 else 0.0
             ),
+            "_child_api_equivalent_usd": str(
+                getattr(child, "_api_equivalent_cost_usd", 0) or 0
+            ),
+            "_child_api_equivalent_unknown_calls": int(
+                getattr(child, "_api_equivalent_unknown_calls", 0) or 0
+            ),
         }
         # Per-delegation spend, serialized back to the model alongside
         # tokens/api_calls so the parent can see what each delegation cost.
@@ -3437,9 +3443,18 @@ def _finalize_child_results(
             invoke_hook = None
 
         children_cost_total = 0.0
+        from decimal import Decimal as _ApiCostDecimal
+        children_api_equivalent_total = _ApiCostDecimal(0)
+        children_api_equivalent_unknown = 0
         for entry in results:
             child_role = entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
+            children_api_equivalent_total += _ApiCostDecimal(
+                entry.pop("_child_api_equivalent_usd", "0")
+            )
+            children_api_equivalent_unknown += int(
+                entry.pop("_child_api_equivalent_unknown_calls", 0)
+            )
             try:
                 if child_cost:
                     children_cost_total += float(child_cost)
@@ -3486,6 +3501,14 @@ def _finalize_child_results(
                     parent_agent.session_cost_status = "estimated"
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
+        parent_agent._api_equivalent_cost_usd = (
+            _ApiCostDecimal(str(getattr(parent_agent, "_api_equivalent_cost_usd", 0) or 0))
+            + children_api_equivalent_total
+        )
+        parent_agent._api_equivalent_unknown_calls = (
+            int(getattr(parent_agent, "_api_equivalent_unknown_calls", 0) or 0)
+            + children_api_equivalent_unknown
+        )
 
 
 def _run_child_lifecycle(

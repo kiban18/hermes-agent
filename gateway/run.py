@@ -5886,6 +5886,10 @@ class TurnRunner:
         )
         agent._gateway_event_metadata = dict(ctx.event_metadata or {})
 
+        from gateway.post_reply_usage import PostReplyUsage
+        _post_reply_usage = PostReplyUsage(ctx._loop_for_step)
+        agent.background_review_usage_callback = _post_reply_usage.record_from_thread
+
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
         _bg_review_pending_lock = threading.Lock()
@@ -6415,7 +6419,64 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # A gateway agent may be reused across Telegram turns.  Its
+            # session_* counters are cumulative, so snapshot them immediately
+            # before the run to report usage for this reply only.
+            _usage_names = (
+                "session_input_tokens", "session_output_tokens",
+                "session_cache_read_tokens", "session_cache_write_tokens",
+                "session_reasoning_tokens", "session_api_calls",
+            )
+            _usage_before = {
+                name: int(getattr(agent, name, 0) or 0) for name in _usage_names
+            }
+            from decimal import Decimal as _UsageDecimal
+            _cost_before = _UsageDecimal(str(getattr(agent, "_api_equivalent_cost_usd", 0) or 0))
+            _unknown_before = int(getattr(agent, "_api_equivalent_unknown_calls", 0) or 0)
+            from uuid import uuid4
+            _usage_turn_id = uuid4().hex
+            _post_reply_usage.turn_id = _usage_turn_id
+            _usage_evaluation = _load_gateway_config().get("usage_evaluation") or {}
+            if not isinstance(_usage_evaluation, dict):
+                _usage_evaluation = {}
+            agent._usage_probe_enabled = bool(_usage_evaluation.get("detailed_calls", False))
+            agent._usage_probe_turn_id = _usage_turn_id
+            agent._usage_probe_phase = str(_usage_evaluation.get("phase") or "asis")
+            agent._usage_probe_profile = get_hermes_home().name
+            try:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            finally:
+                agent._usage_probe_enabled = False
+                agent._usage_probe_turn_id = None
+            if isinstance(result, dict):
+                result["usage_turn_id"] = _usage_turn_id
+                result["post_reply_usage"] = _post_reply_usage
+                result["turn_usage"] = {
+                    name.removeprefix("session_"): max(
+                        0, int(getattr(agent, name, 0) or 0) - _usage_before[name]
+                    )
+                    for name in _usage_names
+                }
+                _unknown_delta = int(getattr(agent, "_api_equivalent_unknown_calls", 0) or 0) - _unknown_before
+                _cost_delta = _UsageDecimal(str(getattr(agent, "_api_equivalent_cost_usd", 0) or 0)) - _cost_before
+                result["api_equivalent_cost_usd"] = (
+                    str(_cost_delta) if (result["turn_usage"]["api_calls"] or _cost_delta > 0)
+                    and not _unknown_delta else None
+                )
+                if result["api_equivalent_cost_usd"] is None and result["turn_usage"]["api_calls"]:
+                    from agent.api_equivalent_cost import verified_turn_cost
+                    _verified_cost = verified_turn_cost(
+                        get_hermes_home(), str(agent.session_id or ""),
+                        _usage_turn_id, result["turn_usage"],
+                    )
+                    if _verified_cost is not None:
+                        result["api_equivalent_cost_usd"] = str(_verified_cost)
+                    else:
+                        logger.warning(
+                            "API-equivalent cost unresolved: session=%s turn=%s calls=%s unknown_delta=%s",
+                            agent.session_id, _usage_turn_id,
+                            result["turn_usage"]["api_calls"], _unknown_delta,
+                        )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -6623,6 +6684,10 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "turn_usage": result.get("turn_usage", {}),
+                "api_equivalent_cost_usd": result.get("api_equivalent_cost_usd"),
+                "usage_turn_id": result.get("usage_turn_id"),
+                "post_reply_usage": result.get("post_reply_usage"),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6704,6 +6769,10 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "model": _resolved_model,
             "context_length": _context_length,
+            "turn_usage": result.get("turn_usage", {}),
+            "api_equivalent_cost_usd": result.get("api_equivalent_cost_usd"),
+            "usage_turn_id": result.get("usage_turn_id"),
+            "post_reply_usage": result.get("post_reply_usage"),
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -20273,6 +20342,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_metadata=dict(event_metadata),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            if isinstance(agent_result, dict):
+                event._post_reply_usage = agent_result.get("post_reply_usage")
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -20479,9 +20550,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # streaming already delivered the body, we can't mutate the sent
             # text, so we fire a separate trailing send below.
             _footer_line = ""
+            _footer_profile = os.environ.get("HERMES_PROFILE") or None
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_profile = None
                 try:
                     from hermes_cli.profiles import get_active_profile_name
                     _footer_profile = get_active_profile_name()
@@ -20496,12 +20567,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
                     profile=_footer_profile,
+                    turn_usage=agent_result.get("turn_usage"),
+                    api_equivalent_cost_usd=agent_result.get("api_equivalent_cost_usd"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
-                response = f"{response}\n\n{_footer_line}"
+                if source.platform == Platform.TELEGRAM:
+                    # Keep a short, editable final footer bubble. Long Telegram
+                    # answer bodies can span several messages; editing their
+                    # last chunk would duplicate or truncate the answer.
+                    event._runtime_footer_delivery = (
+                        _footer_line, agent_result.get("post_reply_usage")
+                    )
+                else:
+                    response = f"{response}\n\n{_footer_line}"
+
+            # Record measured usage for AS-IS/TO-BE comparisons.  This is
+            # independent of the visible footer and contains no message text.
+            try:
+                from gateway.turn_usage_ledger import append_turn_usage
+                from agent.model_metadata import _estimate_tools_tokens_rough
+                _usage_tools = agent_result.get("tools") or []
+                _usage_config = _load_gateway_config()
+                _evaluation_cfg = _usage_config.get("usage_evaluation") or {}
+                append_turn_usage(
+                    home=get_hermes_home(),
+                    session_id=agent_result.get("session_id") or session_entry.session_id,
+                    source=source.platform.value if source.platform else "",
+                    profile=_footer_profile,
+                    model=agent_result.get("model"),
+                    usage=agent_result.get("turn_usage"),
+                    failed=bool(agent_result.get("failed")),
+                    elapsed_seconds=_turn_seconds,
+                    turn_id=agent_result.get("usage_turn_id"),
+                    phase=_evaluation_cfg.get("phase") if isinstance(_evaluation_cfg, dict) else None,
+                    last_prompt_tokens=agent_result.get("last_prompt_tokens") or 0,
+                    context_length=agent_result.get("context_length") or 0,
+                    tool_count=len(_usage_tools),
+                    tool_schema_tokens_estimate=_estimate_tools_tokens_rough(_usage_tools),
+                )
+            except Exception as _usage_err:
+                logger.debug("turn usage ledger write failed: %s", _usage_err)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -20883,11 +20991,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         _foot_adapter = self._adapter_for_source(source)
                         if _foot_adapter:
-                            await _foot_adapter.send(
+                            _foot_result = await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
                                 metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                             )
+                            _post_usage = agent_result.get("post_reply_usage")
+                            if source.platform == Platform.TELEGRAM and _post_usage and _foot_result.success:
+                                _post_usage.bind(_foot_adapter, source.chat_id, _foot_result.message_id, _footer_line)
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
                 # This branch returns None so the adapter does not send the

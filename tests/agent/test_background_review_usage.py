@@ -10,6 +10,7 @@ parent session via the aux-accounting chokepoint.
 from __future__ import annotations
 
 import logging
+import json
 from unittest.mock import patch
 
 import pytest
@@ -71,6 +72,11 @@ def test_records_fork_usage_against_parent_session(db):
     assert r["cache_read_tokens"] == 190000
     assert r["api_call_count"] == 5
     assert r.get("estimated_cost_usd") == 0.05
+    ledger = db.db_path.parent / "logs" / "turn_usage.jsonl"
+    event = json.loads(ledger.read_text().splitlines()[0])
+    assert event["task"] == "background_review"
+    assert event["session_id"] == "sess-parent"
+    assert event["cache_read_tokens"] == 190000
 
 
 def test_accumulates_repeated_forks_same_model(db):
@@ -183,6 +189,18 @@ def test_spawn_reuses_provided_task_cfg_without_rereading():
         )
         assert prompt  # built-in skill-review prompt selected
         assert callable(_target)
+
+
+def test_review_run_keeps_its_originating_turn_usage_callback():
+    agent = type("A", (), {})()
+    first = lambda task, usage: None
+    second = lambda task, usage: None
+    agent.background_review_usage_callback = first
+    run = background_review.prepare_background_review_run(agent)
+    assert run is not None
+    agent.background_review_usage_callback = second
+    assert run.usage_callback is first
+    background_review.finish_background_review_run(agent, run)
 
 def test_log_review_completion_emits_thread_tag(caplog):
     with caplog.at_level(logging.INFO, logger="agent.background_review"):

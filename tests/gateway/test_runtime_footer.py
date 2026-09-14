@@ -106,7 +106,7 @@ def test_resolve_platform_can_add_fields_only():
     tg = resolve_footer_config(user, "telegram")
     assert tg["enabled"] is True
     # Global enable does not wipe Telegram's quieter default field set.
-    assert tg["fields"] == ["profile", "model"]
+    assert tg["fields"] == ["profile", "model", "turn_token_breakdown", "api_equivalent_cost"]
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
@@ -276,7 +276,7 @@ def test_resolve_footer_config_default_fields_exclude_latency():
 def test_telegram_defaults_to_profile_and_model():
     cfg = resolve_footer_config({}, "telegram")
     assert cfg["enabled"] is True
-    assert cfg["fields"] == ["profile", "model"]
+    assert cfg["fields"] == ["profile", "model", "turn_token_breakdown", "api_equivalent_cost"]
     assert cfg["label"] == "AI"
 
 
@@ -292,6 +292,47 @@ def test_telegram_footer_renders_ai_line(monkeypatch):
         profile="proposal_lead",
     )
     assert out == "AI: proposal_lead · gemini-3.5-flash"
+
+
+def test_telegram_footer_reports_four_disjoint_usage_buckets():
+    out = build_footer_line(
+        user_config={}, platform_key="telegram", model="glm-5.3",
+        context_tokens=0, context_length=None, profile="project_lead",
+        turn_usage={"input_tokens": 120, "cache_read_tokens": 2340,
+                    "cache_write_tokens": 40, "output_tokens": 500},
+    )
+    assert out == (
+        "AI: project_lead · glm-5.3 · 비캐시 입력 120 · 비캐시 출력 500"
+        " · 캐시 읽기 입력 2,340 · 캐시 저장 입력 40 · API 환산 미확인"
+    )
+
+
+def test_telegram_footer_can_show_cached_share_without_changing_total():
+    out = build_footer_line(
+        user_config={"display": {"platforms": {"telegram": {
+            "runtime_footer": {"fields": [
+                "profile", "model", "turn_tokens", "cache_read_tokens"
+            ]}
+        }}}},
+        platform_key="telegram", model="grok-4.6",
+        context_tokens=0, context_length=None, profile="project_lead",
+        turn_usage={"input_tokens": 10, "cache_read_tokens": 190,
+                    "cache_write_tokens": 20, "output_tokens": 30},
+    )
+    assert out == "AI: project_lead · grok-4.6 · 250 tokens · cache-read 190"
+
+
+def test_telegram_footer_shows_zero_cache_write_and_noncache_grok_usage():
+    out = build_footer_line(
+        user_config={}, platform_key="telegram", model="grok-4.6",
+        context_tokens=0, context_length=None, profile="project_lead",
+        turn_usage={"input_tokens": 2_579, "cache_read_tokens": 372_864,
+                    "cache_write_tokens": 0, "output_tokens": 855},
+    )
+    assert out == (
+        "AI: project_lead · grok-4.6 · 비캐시 입력 2,579 · 비캐시 출력 855"
+        " · 캐시 읽기 입력 372,864 · 캐시 저장 입력 0 · API 환산 미확인"
+    )
 
 
 @pytest.mark.parametrize(
