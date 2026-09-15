@@ -571,6 +571,28 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     _popen_kwargs: Dict[str, Any] = (
         {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     )
+    # Build the child env through the one factory instead of inheriting
+    # os.environ. The HERMES_SESSION_* mirror in os.environ is written
+    # last-writer-wins and never cleared, so under a concurrent host (gateway,
+    # ACP, API server, TUI) it names whichever turn wrote it last — not this
+    # one. build_subprocess_env resolves each var from the task-local
+    # ContextVar and strips it when this task never bound a session, so a hook
+    # can no longer read a neighbouring turn's identity. 2026-09-15 09:21 a
+    # 사이버컴 turn's room-identity hook read the 월드비전 turn's session out
+    # of that global and declared the wrong room authoritative. Restarting
+    # does not help: that gateway was 61 seconds old.
+    # Import lazily and fall back to inheritance — a hook that cannot spawn is
+    # worse than one with a stale env, and fail_closed hooks gate real work.
+    try:
+        from tools.environments.local import build_subprocess_env
+
+        _popen_kwargs["env"] = build_subprocess_env()
+    except Exception:
+        logger.warning(
+            "shell hook %s: could not build a scrubbed env, inheriting os.environ",
+            spec.command,
+            exc_info=True,
+        )
     try:
         proc = subprocess.Popen(
             argv,
