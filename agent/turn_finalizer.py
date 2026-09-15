@@ -521,6 +521,16 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
+            if _failed:
+                # The footer claims a file was not written, so check the file.
+                # A recovery through any tool other than write_file/patch is
+                # invisible to the recorder and would otherwise be announced as
+                # a failure (rs101 t_00f5c386, 2026-09-15).
+                try:
+                    from agent.file_mutation_fs_check import prune_recovered_mutations
+                    _failed = prune_recovered_mutations(_failed)
+                except Exception as _prune_err:
+                    logger.debug("file-mutation fs check failed: %s", _prune_err)
             if _failed and agent._file_mutation_verifier_enabled():
                 footer = agent._format_file_mutation_failure_footer(_failed)
                 if footer:

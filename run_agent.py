@@ -3656,9 +3656,20 @@ class AIAgent:
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.
                 if path not in state:
+                    # Fingerprint now so turn end can tell "the tool failed and
+                    # nothing wrote this" from "the tool failed and the model
+                    # recovered some other way" — a terminal heredoc, sed, a
+                    # helper script. Only write_file/patch report back here, so
+                    # without this the footer calls a written file unwritten.
+                    try:
+                        from agent.file_mutation_fs_check import fingerprint_path
+                        _fp = fingerprint_path(path)
+                    except Exception:
+                        _fp = None
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "fingerprint": _fp,
                     }
         else:
             for path in targets:
