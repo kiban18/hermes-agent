@@ -6286,6 +6286,16 @@ def resolve_provider_client(
     # ``model`` carries the preset name for moa calls; when the preset can't
     # be resolved we leave the call untouched and let the normal
     # missing-provider handling produce its diagnostic.
+    # ``cursor://`` is a marker for the cursor-agent CLI, not an HTTP endpoint,
+    # so no other provider can serve it. The main agent path already routes on
+    # the base URL as well as the provider name (agent_runtime_helpers); without
+    # the same rule here an auxiliary call that inherited the main runtime's
+    # base URL hands ``cursor://agent`` to httpx and dies with
+    # UnsupportedProtocol — every title, compression and summary on a
+    # cursor-primary profile (project_lead, 2026-09-15).
+    if explicit_base_url and str(explicit_base_url).lower().startswith("cursor://"):
+        provider = "cursor"
+
     if provider == "moa":
         _agg_provider, _agg_model = _resolve_moa_aggregator(model)
         if _agg_provider and _agg_model:
