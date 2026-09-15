@@ -382,6 +382,23 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Same inheritance leak, different module. A message task spawned while a
+    # delegate_task child was running inherits _DELEGATED_CHILD_CONTEXT, and a
+    # gateway message turn is never a delegate_task child. Left set, it stamps
+    # HERMES_DELEGATED_CHILD_CONTEXT onto every subprocess this turn spawns and
+    # the Kanban mutation guard refuses the card the turn was asked to create —
+    # 1,228 times between 2026-08-16 and 2026-09-16, silently, because the agent
+    # answered "별도 채널에서 처리하겠습니다" and dropped the work.
+    #
+    # Only this flag. _NON_DISPATCHER_OWNED_CONTEXT stays inherited on purpose:
+    # it means "I do not own the dispatcher's task", the conservative direction,
+    # and clearing it would let a gateway turn claim a worker's task.
+    try:
+        from agent.delegation_context import _DELEGATED_CHILD_CONTEXT
+
+        _DELEGATED_CHILD_CONTEXT.set(False)
+    except Exception:
+        pass
     try:
         from agent.runtime_cwd import clear_session_cwd
 
