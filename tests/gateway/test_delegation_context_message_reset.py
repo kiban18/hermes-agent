@@ -105,3 +105,38 @@ def test_non_dispatcher_owned_flag_is_left_alone():
         assert is_dispatcher_owned_worker_context() is False
         reset_session_vars()
         assert is_dispatcher_owned_worker_context() is False
+
+
+def test_binding_a_session_identity_also_clears_the_flag():
+    """Every host binds identity through set_session_vars; none of them is a child.
+
+    reset_session_vars covers only the gateway — it is the sole caller. cron,
+    the API server, the TUI and the ACP adapter bind a session and never reset,
+    so the inherited flag survived there and blocked 239 more turns (kanban 93,
+    cron 89, cli 57) than the gateway alone. Clearing it where identity is bound
+    is the placement a new host cannot forget, and it is safe because a
+    delegate_task child never calls set_session_vars.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    token = dc._DELEGATED_CHILD_CONTEXT.set(True)
+    try:
+        tokens = set_session_vars(platform="cron", session_id="cron-1")
+        try:
+            assert is_delegated_child_context() is False
+        finally:
+            clear_session_vars(tokens)
+    finally:
+        dc._DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+def test_binding_does_not_hide_a_real_child_subprocess():
+    """The env marker still wins: a genuine child process stays a child."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    os.environ[DELEGATED_CHILD_ENV_MARKER] = "1"
+    tokens = set_session_vars(platform="cron", session_id="cron-2")
+    try:
+        assert is_delegated_child_process_context() is True
+    finally:
+        clear_session_vars(tokens)

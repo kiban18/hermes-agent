@@ -180,6 +180,23 @@ def _assert_not_delegated_child_mutation() -> None:
     except Exception:
         delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
     if delegated:
+        # Say it out loud. This guard fired 1,228 times between 2026-08-16 and
+        # 2026-09-16 and nobody knew: the agent told the room "별도 채널에서
+        # 처리하겠습니다" and the card was dropped, so a month of blocked work
+        # left no trace anywhere an operator looks. A refusal that costs real
+        # work has to be visible on its own, not inferred from a transcript.
+        try:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "kanban mutation refused: delegated child context "
+                "(session=%s, marker_env=%s). The work this turn was asked to "
+                "record is NOT on any board.",
+                (os.environ.get("HERMES_SESSION_ID") or "?")[:24],
+                bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")),
+            )
+        except Exception:
+            pass
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )

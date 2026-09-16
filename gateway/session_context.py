@@ -288,6 +288,22 @@ def set_session_vars(
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
+    # Binding a session identity means a host is starting a turn of its own, and
+    # a delegate_task child never calls this — so an inherited
+    # _DELEGATED_CHILD_CONTEXT here is always stale. reset_session_vars clears
+    # it too, but the gateway is that function's only caller; cron, the API
+    # server, the TUI and the ACP adapter bind a session and never reset, which
+    # left 239 more turns blocked from Kanban than the gateway alone. Clearing
+    # it where identity is bound is the placement a new host cannot forget.
+    #
+    # The process marker (HERMES_DELEGATED_CHILD_ENV_MARKER) is untouched, so a
+    # genuine child subprocess is still recognised as one.
+    try:
+        from agent.delegation_context import _DELEGATED_CHILD_CONTEXT
+
+        _DELEGATED_CHILD_CONTEXT.set(False)
+    except Exception:
+        pass
     try:
         from agent.runtime_cwd import set_session_cwd
 
