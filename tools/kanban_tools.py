@@ -100,6 +100,52 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     )
 
 
+def _queue_kanban_create_intent(args: Dict[str, Any]) -> str:
+    """Hand a blocked card to the parent instead of losing it.
+
+    The guard stays: nothing here writes to Kanban. It records what the child
+    wanted so the parent can create it, and returns the receipt so the child
+    can say where the work went. Before this, a refusal ended with the agent
+    announcing "별도 채널에서 처리하겠습니다" and the card existing nowhere —
+    753 times between 2026-08-16 and 2026-09-16.
+
+    A failure to queue is reported as a failure. Silently swallowing it would
+    rebuild the exact hole this replaces.
+    """
+    import os as _os
+
+    try:
+        from agent.kanban_intake import record as _record
+
+        receipt = _record(
+            {k: v for k, v in (args or {}).items() if v is not None},
+            session_id=_os.environ.get("HERMES_SESSION_ID") or "unknown",
+        )
+    except Exception as exc:
+        logger.warning("kanban_create intake failed: %s", exc, exc_info=True)
+        return tool_error(
+            "kanban_create refused (delegate_task child) AND the intake queue "
+            f"could not accept it: {exc}. The card is NOT recorded anywhere — "
+            "report this to the person running the turn rather than assuming "
+            "it will be handled elsewhere."
+        )
+    logger.warning(
+        "kanban_create queued for the parent (receipt=%s, title=%r)",
+        receipt, (args or {}).get("title"),
+    )
+    return json.dumps({
+        "success": True,
+        "queued": True,
+        "receipt": receipt,
+        "message": (
+            "delegate_task child agents cannot create board cards directly. "
+            f"The card is queued for the parent agent as receipt {receipt} and "
+            "will be created when this delegation returns. Say it is queued "
+            "with this receipt — do not claim it was handled in another channel."
+        ),
+    }, ensure_ascii=False)
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -1409,9 +1455,13 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
-    delegated_err = _reject_delegated_child_mutation("kanban_create")
-    if delegated_err:
-        return delegated_err
+    if _is_delegated_child_context():
+        # Creation is the one refusal worth queueing. Completing, blocking or
+        # commenting on an existing card is dangerous precisely because the
+        # child may be aiming at its parent's task; a queue would only launder
+        # that. A brand-new card touches nobody's lineage, so the child records
+        # the intent and the parent — which owns the board — creates it.
+        return _queue_kanban_create_intent(args)
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")

@@ -3406,6 +3406,56 @@ def _parent_finalization_lock(parent_agent) -> threading.RLock:
     return lock
 
 
+def _drain_child_kanban_intake(results: List[Dict[str, Any]]) -> None:
+    """Surface cards the children queued because they could not create them.
+
+    A delegated child is refused at the board and records the card in its own
+    intake instead (agent.kanban_intake). This runs in the parent, which is not
+    a delegated context, so the parent can act on them — and the parent is told
+    about them here rather than having to know the queue exists.
+
+    Reporting only, not creating: the parent is an agent with its own judgement
+    about what belongs on its board, and a finalizer that silently wrote cards
+    would be a second actor mutating Kanban behind everyone's back — the shape
+    this whole guard exists to prevent. The entries stay pending until the
+    parent creates them, and agent.kanban_intake.stale() makes an ignored queue
+    loud instead of letting it become the next silent hole.
+    """
+    try:
+        from agent.kanban_intake import pending
+    except Exception:
+        return
+    seen: set[str] = set()
+    queued: List[Dict[str, Any]] = []
+    for entry in results or []:
+        session_id = str((entry or {}).get("child_session_id") or "").strip()
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        try:
+            queued.extend(pending(session_id))
+        except Exception:
+            logger.debug("kanban intake unreadable for %s", session_id, exc_info=True)
+    if not queued:
+        return
+    logger.warning(
+        "%d Kanban card(s) were queued by delegated children and are NOT on any "
+        "board yet: %s",
+        len(queued),
+        ", ".join(
+            f"{r.get('receipt')}({(r.get('intent') or {}).get('title', '?')!r})"
+            for r in queued[:5]
+        ),
+    )
+    for entry in results or []:
+        if str((entry or {}).get("child_session_id") or "") in seen:
+            entry.setdefault("kanban_intake_pending", [
+                {"receipt": r.get("receipt"), "intent": r.get("intent")}
+                for r in queued
+                if r.get("session_id") == entry.get("child_session_id")
+            ])
+
+
 def _finalize_child_results(
     results: List[Dict[str, Any]],
     task_list: List[Dict[str, Any]],
@@ -3414,6 +3464,7 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
+        _drain_child_kanban_intake(results)
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
