@@ -3497,6 +3497,23 @@ def _finalize_child_results(
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
         _drain_child_kanban_intake(results)
+        # Remember which children this turn delegated to, so the turn-end guard
+        # can ask their queues whether anything is still unmade. Without it the
+        # only thing standing between a queued card and silence is the parent
+        # choosing to act on a notice.
+        try:
+            sessions = {
+                str((entry or {}).get("child_session_id") or "").strip()
+                for entry in results or []
+            } - {""}
+            if sessions and parent_agent is not None:
+                existing = getattr(parent_agent, "_turn_delegated_child_sessions", None)
+                if existing is None:
+                    parent_agent._turn_delegated_child_sessions = set(sessions)
+                else:
+                    existing.update(sessions)
+        except Exception:
+            logger.debug("could not record delegated child sessions", exc_info=True)
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 

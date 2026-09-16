@@ -520,6 +520,18 @@ def finalize_turn(
     # already have other surface text that shouldn't be augmented.
     if final_response and not interrupted:
         try:
+            _intake_sessions = getattr(agent, "_turn_delegated_child_sessions", None)
+            if _intake_sessions:
+                from agent.kanban_intake_turn_guard import (
+                    format_pending_intake_footer,
+                    pending_intake_for_turn,
+                )
+
+                _intake_footer = format_pending_intake_footer(
+                    pending_intake_for_turn(_intake_sessions)
+                )
+                if _intake_footer:
+                    final_response = final_response.rstrip() + "\n\n" + _intake_footer
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed:
                 # The footer claims a file was not written, so check the file.
