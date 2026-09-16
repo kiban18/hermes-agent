@@ -3448,12 +3448,44 @@ def _drain_child_kanban_intake(results: List[Dict[str, Any]]) -> None:
         ),
     )
     for entry in results or []:
-        if str((entry or {}).get("child_session_id") or "") in seen:
-            entry.setdefault("kanban_intake_pending", [
-                {"receipt": r.get("receipt"), "intent": r.get("intent")}
-                for r in queued
-                if r.get("session_id") == entry.get("child_session_id")
-            ])
+        sid = str((entry or {}).get("child_session_id") or "")
+        if sid not in seen:
+            continue
+        mine = [
+            {"receipt": r.get("receipt"), "intent": r.get("intent")}
+            for r in queued if r.get("session_id") == sid
+        ]
+        if not mine:
+            continue
+        entry.setdefault("kanban_intake_pending", mine)
+        # Put it where the model actually reads. A field on the result is data
+        # the parent may never look at; the summary is the part it is given to
+        # act on, and the previous version of this failure was precisely an
+        # agent that had the information and did nothing useful with it.
+        lines = [
+            "",
+            f"[칸반 접수 {len(mine)}건] 이 자식은 카드를 직접 만들 수 없어 접수만 했습니다. "
+            "아직 어느 보드에도 없습니다. 당신이 만들어야 합니다.",
+        ]
+        for item in mine[:5]:
+            intent = item.get("intent") or {}
+            lines.append(
+                f"  - receipt={item.get('receipt')} board={intent.get('board') or '?'} "
+                f"assignee={intent.get('assignee') or '?'} title={intent.get('title') or '?'}"
+            )
+        if len(mine) > 5:
+            lines.append(f"  - 외 {len(mine) - 5}건")
+        lines.append(
+            "각 건을 kanban_create 로 만들고 receipt 를 함께 넘겨 접수를 닫으세요. "
+            "만들지 않으면 그 일은 사라집니다. 다른 채널에서 처리된다고 말하지 마세요."
+        )
+        note = "\n".join(lines)
+        for key in ("summary", "result", "output"):
+            if isinstance(entry.get(key), str):
+                entry[key] = entry[key].rstrip() + "\n" + note
+                break
+        else:
+            entry["kanban_intake_notice"] = note.strip()
 
 
 def _finalize_child_results(

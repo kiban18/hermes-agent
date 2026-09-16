@@ -100,6 +100,39 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     )
 
 
+def _close_kanban_intake_receipt(receipt: Any, task_id: str) -> bool:
+    """Mark a queued intent created, so a served card stops looking abandoned.
+
+    Closing is explicit — the parent passes back the receipt it was given —
+    rather than matched by title or body. Loose matching would eventually close
+    the wrong entry, and the whole reason this machinery exists is that hermes
+    guessed an identity it did not actually have. An unmatched receipt is
+    reported as unclosed instead of being treated as success, because a queue
+    that quietly empties itself is the failure this replaces.
+    """
+    receipt = str(receipt or "").strip()
+    if not receipt:
+        return False
+    import os as _os
+
+    try:
+        from agent.kanban_intake import intake_dir, mark_done, pending
+
+        for path in sorted(intake_dir().glob("*.jsonl")):
+            session_id = path.stem
+            if any(r.get("receipt") == receipt for r in pending(session_id)):
+                mark_done(session_id, [receipt], task_ids={receipt: task_id})
+                return True
+    except Exception as exc:
+        logger.warning("kanban intake receipt %s not closed: %s", receipt, exc)
+        return False
+    logger.warning(
+        "kanban_create carried receipt %s but no pending intake entry matches; "
+        "the queued card may still be outstanding", receipt,
+    )
+    return False
+
+
 def _queue_kanban_create_intent(args: Dict[str, Any]) -> str:
     """Hand a blocked card to the parent instead of losing it.
 
@@ -1577,6 +1610,7 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            closed = _close_kanban_intake_receipt(args.get("receipt"), new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1584,6 +1618,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                **({"receipt_closed": closed} if args.get("receipt") else {}),
             )
         finally:
             conn.close()
@@ -2308,6 +2343,16 @@ KANBAN_CREATE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "receipt": {
+                "type": "string",
+                "description": (
+                    "Receipt from a delegated child's queued card "
+                    "(kanban_intake_pending in a delegate_task result). Pass it "
+                    "when creating that card so the queue entry is closed; "
+                    "without it the entry stays pending and is reported as "
+                    "abandoned."
+                ),
+            },
             "title": {
                 "type": "string",
                 "description": "Short task title (required).",
