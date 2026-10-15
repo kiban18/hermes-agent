@@ -2894,6 +2894,49 @@ def switch_board(slug: str):
 # the simplest and most robust approach; it adds a fraction of a percent
 # of CPU and has no shared state to synchronize across workers.
 _EVENT_POLL_SECONDS = 0.3
+# The all-boards tail re-reads every board.json to list boards; doing that
+# every 0.3 s is pure file churn, and a new board showing up a few seconds
+# late in the live feed costs nothing.
+_EVENT_BOARD_LIST_TTL_SECONDS = 5.0
+_EVENT_FETCH_LIMIT = 200
+
+
+def _event_db_fingerprint(path: Path) -> Optional[tuple]:
+    """Identity, size and mtime of a board DB and its WAL; ``None`` if absent.
+
+    Every committed write changes one of these: it either appends to the WAL
+    or, after a checkpoint, rewrites the main file. An unchanged fingerprint
+    therefore means the board has no new events, and the poll skips it
+    without opening SQLite at all.
+    """
+    parts: list = []
+    for p in (path, path.with_name(path.name + "-wal")):
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            if p == path:
+                return None
+            parts.append(None)
+            continue
+        parts.append((st.st_ino, st.st_size, st.st_mtime_ns))
+    return tuple(parts)
+
+
+def _open_event_db_readonly(path: Path) -> sqlite3.Connection:
+    """Read-only connection for the event tail.
+
+    The tail used to open each board with the writable ``kanban_db.connect``
+    on every 0.3 s poll. When the last writer closes, SQLite checkpoints and
+    deletes the board's ``-wal``/``-shm``, and the next poll creates them
+    again. With "All boards" open that came to ~100 file create/delete events
+    per second across ~30 boards, plus a mkdir and pragma setup per open
+    (measured 2026-10-15; that event volume kept macOS fseventsd growing). A
+    read-only connection never checkpoints or deletes the sidecars, and it
+    never creates or migrates a DB on the reader's behalf.
+    """
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -3204,77 +3247,99 @@ async def stream_events(ws: WebSocket):
                 ws_board = None
 
         per_board_cursors: dict[str, int] = {}
-        if ws_board == ALL_BOARDS_SLUG:
-            from hermes_cli import kanban_aggregator as ka
-            for slug in ka.get_all_board_slugs():
-                conn = kanban_db.connect(board=slug)
-                try:
-                    row = conn.execute(
-                        "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-                    ).fetchone()
-                    per_board_cursors[slug] = int(row["m"] if row else 0)
-                finally:
-                    conn.close()
+        fingerprints: dict[str, tuple] = {}
+        board_list: list[str] = []
+        board_list_at = 0.0
 
-        def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
-            if ws_board == ALL_BOARDS_SLUG:
+        def _board_slugs() -> list[str]:
+            nonlocal board_list, board_list_at
+            now = time.monotonic()
+            if not board_list or now - board_list_at >= _EVENT_BOARD_LIST_TTL_SECONDS:
                 from hermes_cli import kanban_aggregator as ka
-                out: list[dict] = []
-                new_cursor = cursor_val
-                for slug in ka.get_all_board_slugs():
-                    since = per_board_cursors.get(slug, cursor_val)
-                    conn = kanban_db.connect(board=slug)
-                    try:
-                        rows = conn.execute(
-                            "SELECT id, task_id, run_id, kind, payload, created_at "
-                            "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
-                            (since,),
-                        ).fetchall()
-                        for r in rows:
-                            try:
-                                payload = json.loads(r["payload"]) if r["payload"] else None
-                            except Exception:
-                                payload = None
-                            out.append({
-                                "id": r["id"],
-                                "task_id": r["task_id"],
-                                "run_id": r["run_id"],
-                                "kind": r["kind"],
-                                "payload": payload,
-                                "created_at": r["created_at"],
-                                "board_slug": slug,
-                            })
-                            per_board_cursors[slug] = int(r["id"])
-                            new_cursor = max(new_cursor, int(r["id"]))
-                    finally:
-                        conn.close()
-                return new_cursor, out
-            conn = kanban_db.connect(board=ws_board)
+                board_list = ka.get_all_board_slugs()
+                board_list_at = now
+            return board_list
+
+        def _read_events(slug: Optional[str], since: int) -> list:
+            """Rows after ``since``, or ``[]`` when the board has nothing new.
+
+            The fingerprint is stored only after a read that returned less
+            than the limit, so a backlog larger than one page is read again
+            on the next poll instead of being skipped.
+            """
+            path = kanban_db.kanban_db_path(board=slug)
+            key = slug or ""
+            fp = _event_db_fingerprint(path)
+            if fp is None or fingerprints.get(key) == fp:
+                return []
+            try:
+                conn = _open_event_db_readonly(path)
+            except sqlite3.Error as exc:
+                log.debug("kanban event tail: cannot open %s: %s", path, exc)
+                return []
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "
-                    "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
-                    (cursor_val,),
+                    "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                    (since, _EVENT_FETCH_LIMIT),
                 ).fetchall()
-                out: list[dict] = []
-                new_cursor = cursor_val
-                for r in rows:
-                    try:
-                        payload = json.loads(r["payload"]) if r["payload"] else None
-                    except Exception:
-                        payload = None
-                    out.append({
-                        "id": r["id"],
-                        "task_id": r["task_id"],
-                        "run_id": r["run_id"],
-                        "kind": r["kind"],
-                        "payload": payload,
-                        "created_at": r["created_at"],
-                    })
-                    new_cursor = r["id"]
-                return new_cursor, out
+            except sqlite3.Error as exc:  # e.g. a DB file with no schema yet
+                log.debug("kanban event tail: cannot read %s: %s", path, exc)
+                return []
             finally:
                 conn.close()
+            if len(rows) < _EVENT_FETCH_LIMIT:
+                fingerprints[key] = fp
+            return rows
+
+        def _event(r) -> dict:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            return {
+                "id": r["id"],
+                "task_id": r["task_id"],
+                "run_id": r["run_id"],
+                "kind": r["kind"],
+                "payload": payload,
+                "created_at": r["created_at"],
+            }
+
+        if ws_board == ALL_BOARDS_SLUG:
+            for slug in _board_slugs():
+                path = kanban_db.kanban_db_path(board=slug)
+                if not path.exists():
+                    # No DB yet means no events yet: all it gets later is new.
+                    per_board_cursors[slug] = 0
+                    continue
+                try:
+                    conn = _open_event_db_readonly(path)
+                    try:
+                        row = conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                except sqlite3.Error as exc:
+                    log.debug("kanban event tail: no start cursor for %s: %s", slug, exc)
+                    continue
+                per_board_cursors[slug] = int(row["m"] if row else 0)
+
+        def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
+            out: list[dict] = []
+            new_cursor = cursor_val
+            if ws_board == ALL_BOARDS_SLUG:
+                for slug in _board_slugs():
+                    for r in _read_events(slug, per_board_cursors.get(slug, cursor_val)):
+                        out.append({**_event(r), "board_slug": slug})
+                        per_board_cursors[slug] = int(r["id"])
+                        new_cursor = max(new_cursor, int(r["id"]))
+                return new_cursor, out
+            for r in _read_events(ws_board, cursor_val):
+                out.append(_event(r))
+                new_cursor = r["id"]
+            return new_cursor, out
 
         while True:
             # Race receive() against the poll interval to detect client
