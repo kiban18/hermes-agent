@@ -2904,6 +2904,8 @@ _EVENT_FETCH_LIMIT = 200
 # read at least this often regardless, which bounds any such miss to a
 # delay instead of a lost event.
 _EVENT_FORCE_READ_SECONDS = 10.0
+# How often a board whose start cursor could not be read is tried again.
+_EVENT_PENDING_RETRY_SECONDS = 2.0
 
 
 def _event_db_fingerprint(path: Path) -> Optional[tuple]:
@@ -3253,9 +3255,12 @@ async def stream_events(ws: WebSocket):
 
         per_board_cursors: dict[str, int] = {}
         # Boards present at the handshake whose start cursor could not be
-        # read yet. They are retried every poll; tailing one from the global
+        # read yet, with the next retry time. Tailing one from the global
         # cursor instead would skip any of its events numbered below it.
-        pending_start: set[str] = set()
+        pending_start: dict[str, float] = {}
+        # created_at is whole seconds; events from the handshake second on
+        # count as new for a board that joins late (at-least-once at the edge).
+        handshake_s = int(time.time())
         fingerprints: dict[str, tuple] = {}
         last_read_at: dict[str, float] = {}
         board_list: list[str] = []
@@ -3323,8 +3328,14 @@ async def stream_events(ws: WebSocket):
                 "created_at": r["created_at"],
             }
 
-        def _start_cursor(slug: str) -> bool:
-            """Set ``slug``'s cursor to its newest event; False if unreadable."""
+        def _start_cursor(slug: str, *, late: bool = False) -> bool:
+            """Set ``slug``'s cursor to its newest event at the handshake.
+
+            Returns False when the DB cannot be read yet. A ``late`` retry
+            that succeeds after the handshake counts only events from before
+            the handshake second as seen, so events written while the board
+            was unreadable are still delivered.
+            """
             path = kanban_db.kanban_db_path(board=slug)
             if not path.exists():
                 # No DB yet means no events yet: all it gets later is new.
@@ -3333,9 +3344,16 @@ async def stream_events(ws: WebSocket):
             try:
                 conn = _open_event_db_readonly(path)
                 try:
-                    row = conn.execute(
-                        "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-                    ).fetchone()
+                    if late:
+                        row = conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+                            "WHERE created_at < ?",
+                            (handshake_s,),
+                        ).fetchone()
+                    else:
+                        row = conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+                        ).fetchone()
                 finally:
                     conn.close()
             except sqlite3.Error as exc:
@@ -3347,7 +3365,7 @@ async def stream_events(ws: WebSocket):
         if ws_board == ALL_BOARDS_SLUG:
             for slug in _board_slugs():
                 if not _start_cursor(slug):
-                    pending_start.add(slug)
+                    pending_start[slug] = time.monotonic() + _EVENT_PENDING_RETRY_SECONDS
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             out: list[dict] = []
@@ -3355,9 +3373,13 @@ async def stream_events(ws: WebSocket):
             if ws_board == ALL_BOARDS_SLUG:
                 for slug in _board_slugs():
                     if slug in pending_start:
-                        if _start_cursor(slug):
-                            pending_start.discard(slug)
-                        continue
+                        now = time.monotonic()
+                        if now < pending_start[slug]:
+                            continue
+                        if not _start_cursor(slug, late=True):
+                            pending_start[slug] = now + _EVENT_PENDING_RETRY_SECONDS
+                            continue
+                        del pending_start[slug]
                     # A board that appeared after the handshake: everything
                     # on it is new to this client.
                     since = per_board_cursors.setdefault(slug, 0)

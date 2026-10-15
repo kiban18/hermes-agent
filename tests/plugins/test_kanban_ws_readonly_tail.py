@@ -202,11 +202,16 @@ def test_unreadable_board_at_handshake_is_retried_not_skipped(fresh_home, monkey
     for i in range(3):
         _add_task("alpha", f"t{i}")
     _add_task("beta", "history")
+    # Make beta's history clearly older than the handshake second.
+    with kb.connect_closing(board="beta") as conn:
+        conn.execute("UPDATE task_events SET created_at = created_at - 10")
+        conn.commit()
     history = set(_all_event_ids("beta"))
     mod = _load_plugin_module()
     _prepare(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_EVENT_PENDING_RETRY_SECONDS", 0.0)
     real_open = mod._open_event_db_readonly
-    failures = {"beta": 1}
+    failures = {"beta": 2}    # the handshake read and the first retry both fail
 
     def flaky_open(path):
         if path.parent.name == "beta" and failures["beta"]:
@@ -215,12 +220,15 @@ def test_unreadable_board_at_handshake_is_retried_not_skipped(fresh_home, monkey
         return real_open(path)
 
     monkeypatch.setattr(mod, "_open_event_db_readonly", flaky_open)
+    # poll 0: retry fails. Then beta gets a live event BEFORE the retry
+    # that succeeds (poll 1): it must still be delivered.
     ws = _ScriptedWebSocket({"board": "*", "since": "0"},
                             [None, lambda: _add_task("beta", "live"), None, None])
     asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
 
     beta = [e["id"] for b in ws.sent for e in b["events"] if e["board_slug"] == "beta"]
-    assert beta, "beta's live event was lost after its start cursor failed once"
+    assert failures["beta"] == 0
+    assert beta, "beta's live event was lost while its start cursor was unreadable"
     assert not history & set(beta), "beta's history was replayed as new"
 
 
