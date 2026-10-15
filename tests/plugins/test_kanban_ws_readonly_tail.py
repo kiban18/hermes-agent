@@ -127,26 +127,31 @@ def test_all_boards_tail_is_readonly_and_skips_unchanged_boards(fresh_home, monk
     def mark():
         seen.append(opens["n"])
 
+    # A writer closing last deletes the sidecars, so a board needs two reads
+    # to settle: one that recreates the -wal, one that records its
+    # fingerprint. After that an idle poll must not open SQLite at all.
     ws = _ScriptedWebSocket(
         {"board": "*", "since": "0"},
-        # settle, settle, idle, write to alpha, idle, idle
-        [mark, mark, mark, lambda: (mark(), _add_task("alpha", "live")), mark, mark],
+        [mark, mark, mark,                                   # polls 0-2: settle, idle
+         lambda: (mark(), _add_task("alpha", "live")),      # poll 3: after a write
+         mark, mark, mark],                                  # polls 4-6: settle, idle
     )
     asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
 
     events = [e for batch in ws.sent for e in batch["events"]]
     assert events, "the live write to alpha was not delivered"
     assert {e["board_slug"] for e in events} == {"alpha"}
-    assert all(e["id"] > 0 for e in events)
 
-    # seen[i] is the open count just before poll i. Idle polls after the
-    # boards settled must not open SQLite; the poll after the write must.
-    idle_after_settle = seen[2] - seen[1]
-    after_write = seen[4] - seen[3]
-    idle_after_write = opens["n"] - seen[5]
-    assert idle_after_settle == 0
-    assert after_write >= 1
-    assert idle_after_write == 0
+    # seen[i] is the open count just before poll i.
+    assert seen[3] - seen[2] == 0, "idle poll reopened an unchanged board"
+    assert seen[4] - seen[3] >= 1, "poll after the write did not read alpha"
+    assert opens["n"] - seen[6] == 0, "idle poll after the write reopened a board"
+
+    # The reader closed last, and a read-only connection never deletes the
+    # sidecars. The old writable tail removed them on every close.
+    alpha = kb.kanban_db_path(board="alpha")
+    assert alpha.with_name("kanban.db-wal").exists()
+    assert alpha.with_name("kanban.db-shm").exists()
 
 
 def test_backlog_larger_than_a_page_is_delivered_once_each(fresh_home, monkeypatch):
@@ -165,6 +170,77 @@ def test_backlog_larger_than_a_page_is_delivered_once_each(fresh_home, monkeypat
 
     delivered = [e["id"] for batch in ws.sent for e in batch["events"]]
     assert delivered == expected
+
+
+def test_board_created_after_the_handshake_is_tailed_from_zero(fresh_home, monkeypatch):
+    kb.create_board("alpha")
+    for i in range(4):
+        _add_task("alpha", f"t{i}")      # alpha's cursor ends well above 1
+    mod = _load_plugin_module()
+    _prepare(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_EVENT_BOARD_LIST_TTL_SECONDS", 0.0)
+
+    def make_beta():
+        kb.create_board("beta")
+        _add_task("beta", "first")
+
+    # A live alpha event first moves the stream's global cursor above every
+    # id beta will have; beta must still be read from its own zero.
+    ws = _ScriptedWebSocket({"board": "*", "since": "0"},
+                            [lambda: _add_task("alpha", "live"), None, make_beta, None, None])
+    asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
+    assert ws.sent and ws.sent[0]["cursor"] > max(_all_event_ids("beta"))
+
+    beta_ids = [e["id"] for b in ws.sent for e in b["events"] if e["board_slug"] == "beta"]
+    assert beta_ids == _all_event_ids("beta")
+    assert min(beta_ids) < max(_all_event_ids("alpha"))   # would be skipped by a global cursor
+
+
+def test_unreadable_board_at_handshake_is_retried_not_skipped(fresh_home, monkeypatch):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    for i in range(3):
+        _add_task("alpha", f"t{i}")
+    _add_task("beta", "history")
+    history = set(_all_event_ids("beta"))
+    mod = _load_plugin_module()
+    _prepare(monkeypatch, mod)
+    real_open = mod._open_event_db_readonly
+    failures = {"beta": 1}
+
+    def flaky_open(path):
+        if path.parent.name == "beta" and failures["beta"]:
+            failures["beta"] -= 1
+            raise mod.sqlite3.OperationalError("database is locked")
+        return real_open(path)
+
+    monkeypatch.setattr(mod, "_open_event_db_readonly", flaky_open)
+    ws = _ScriptedWebSocket({"board": "*", "since": "0"},
+                            [None, lambda: _add_task("beta", "live"), None, None])
+    asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
+
+    beta = [e["id"] for b in ws.sent for e in b["events"] if e["board_slug"] == "beta"]
+    assert beta, "beta's live event was lost after its start cursor failed once"
+    assert not history & set(beta), "beta's history was replayed as new"
+
+
+def test_fingerprint_needs_a_wal_and_a_forced_read_still_happens(fresh_home, monkeypatch):
+    kb.create_board("alpha")
+    _add_task("alpha", "x")
+    mod = _load_plugin_module()
+    path = kb.kanban_db_path(board="alpha")
+    wal = path.with_name("kanban.db-wal")
+    if wal.exists():
+        wal.unlink()
+    assert mod._event_db_fingerprint(path) is None       # no -wal: never skipped
+    wal.touch()
+    assert mod._event_db_fingerprint(path) is not None
+
+    opens = _prepare(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_EVENT_FORCE_READ_SECONDS", 0.0)
+    ws = _ScriptedWebSocket({"board": "alpha", "since": "0"}, [None, None, None, None])
+    asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
+    assert opens["n"] >= 4                                  # every poll reads
 
 
 def test_board_without_a_db_is_not_created_by_the_tail(fresh_home, monkeypatch):

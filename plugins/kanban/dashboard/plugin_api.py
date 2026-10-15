@@ -2899,25 +2899,29 @@ _EVENT_POLL_SECONDS = 0.3
 # late in the live feed costs nothing.
 _EVENT_BOARD_LIST_TTL_SECONDS = 5.0
 _EVENT_FETCH_LIMIT = 200
+# The fingerprint skip is an optimisation, not a commit counter: a reset WAL
+# or a coarse-mtime filesystem can in principle repeat one. Every board is
+# read at least this often regardless, which bounds any such miss to a
+# delay instead of a lost event.
+_EVENT_FORCE_READ_SECONDS = 10.0
 
 
 def _event_db_fingerprint(path: Path) -> Optional[tuple]:
-    """Identity, size and mtime of a board DB and its WAL; ``None`` if absent.
+    """Identity, size and mtime of a board DB and its WAL.
 
-    Every committed write changes one of these: it either appends to the WAL
-    or, after a checkpoint, rewrites the main file. An unchanged fingerprint
-    therefore means the board has no new events, and the poll skips it
-    without opening SQLite at all.
+    In WAL mode every commit appends to the ``-wal`` file (or, after a
+    checkpoint, restarts it), which changes its size or mtime, so a repeat of
+    the fingerprint means nothing new to read and the poll skips the board
+    without opening SQLite. Returns ``None`` when the DB is absent, or when
+    there is no ``-wal`` (a rollback-journal board can rewrite a page in place
+    at the same size), so those boards are always read.
     """
     parts: list = []
     for p in (path, path.with_name(path.name + "-wal")):
         try:
             st = p.stat()
         except FileNotFoundError:
-            if p == path:
-                return None
-            parts.append(None)
-            continue
+            return None
         parts.append((st.st_ino, st.st_size, st.st_mtime_ns))
     return tuple(parts)
 
@@ -2931,8 +2935,9 @@ def _open_event_db_readonly(path: Path) -> sqlite3.Connection:
     again. With "All boards" open that came to ~100 file create/delete events
     per second across ~30 boards, plus a mkdir and pragma setup per open
     (measured 2026-10-15; that event volume kept macOS fseventsd growing). A
-    read-only connection never checkpoints or deletes the sidecars, and it
-    never creates or migrates a DB on the reader's behalf.
+    read-only connection never checkpoints or deletes the sidecars and never
+    creates or migrates a DB. It may create a missing ``-wal``/``-shm`` once,
+    and after that they stay in place.
     """
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -3247,7 +3252,12 @@ async def stream_events(ws: WebSocket):
                 ws_board = None
 
         per_board_cursors: dict[str, int] = {}
+        # Boards present at the handshake whose start cursor could not be
+        # read yet. They are retried every poll; tailing one from the global
+        # cursor instead would skip any of its events numbered below it.
+        pending_start: set[str] = set()
         fingerprints: dict[str, tuple] = {}
+        last_read_at: dict[str, float] = {}
         board_list: list[str] = []
         board_list_at = 0.0
 
@@ -3269,8 +3279,12 @@ async def stream_events(ws: WebSocket):
             """
             path = kanban_db.kanban_db_path(board=slug)
             key = slug or ""
+            if not path.exists():
+                return []
+            now = time.monotonic()
             fp = _event_db_fingerprint(path)
-            if fp is None or fingerprints.get(key) == fp:
+            if (fp is not None and fingerprints.get(key) == fp
+                    and now - last_read_at.get(key, 0.0) < _EVENT_FORCE_READ_SECONDS):
                 return []
             try:
                 conn = _open_event_db_readonly(path)
@@ -3288,8 +3302,11 @@ async def stream_events(ws: WebSocket):
                 return []
             finally:
                 conn.close()
-            if len(rows) < _EVENT_FETCH_LIMIT:
+            last_read_at[key] = now
+            if fp is not None and len(rows) < _EVENT_FETCH_LIMIT:
                 fingerprints[key] = fp
+            else:
+                fingerprints.pop(key, None)
             return rows
 
         def _event(r) -> dict:
@@ -3306,32 +3323,45 @@ async def stream_events(ws: WebSocket):
                 "created_at": r["created_at"],
             }
 
+        def _start_cursor(slug: str) -> bool:
+            """Set ``slug``'s cursor to its newest event; False if unreadable."""
+            path = kanban_db.kanban_db_path(board=slug)
+            if not path.exists():
+                # No DB yet means no events yet: all it gets later is new.
+                per_board_cursors[slug] = 0
+                return True
+            try:
+                conn = _open_event_db_readonly(path)
+                try:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                log.debug("kanban event tail: no start cursor for %s yet: %s", slug, exc)
+                return False
+            per_board_cursors[slug] = int(row["m"] if row else 0)
+            return True
+
         if ws_board == ALL_BOARDS_SLUG:
             for slug in _board_slugs():
-                path = kanban_db.kanban_db_path(board=slug)
-                if not path.exists():
-                    # No DB yet means no events yet: all it gets later is new.
-                    per_board_cursors[slug] = 0
-                    continue
-                try:
-                    conn = _open_event_db_readonly(path)
-                    try:
-                        row = conn.execute(
-                            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-                        ).fetchone()
-                    finally:
-                        conn.close()
-                except sqlite3.Error as exc:
-                    log.debug("kanban event tail: no start cursor for %s: %s", slug, exc)
-                    continue
-                per_board_cursors[slug] = int(row["m"] if row else 0)
+                if not _start_cursor(slug):
+                    pending_start.add(slug)
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             out: list[dict] = []
             new_cursor = cursor_val
             if ws_board == ALL_BOARDS_SLUG:
                 for slug in _board_slugs():
-                    for r in _read_events(slug, per_board_cursors.get(slug, cursor_val)):
+                    if slug in pending_start:
+                        if _start_cursor(slug):
+                            pending_start.discard(slug)
+                        continue
+                    # A board that appeared after the handshake: everything
+                    # on it is new to this client.
+                    since = per_board_cursors.setdefault(slug, 0)
+                    for r in _read_events(slug, since):
                         out.append({**_event(r), "board_slug": slug})
                         per_board_cursors[slug] = int(r["id"])
                         new_cursor = max(new_cursor, int(r["id"]))
