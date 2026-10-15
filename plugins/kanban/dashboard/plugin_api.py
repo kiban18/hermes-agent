@@ -2906,6 +2906,12 @@ _EVENT_FETCH_LIMIT = 200
 _EVENT_FORCE_READ_SECONDS = 10.0
 # How often a board whose start cursor could not be read is tried again.
 _EVENT_PENDING_RETRY_SECONDS = 2.0
+# A board that becomes readable only after the handshake re-sends its events
+# from this long before the handshake. created_at is stamped at insert, not
+# commit, and writers' clocks can differ, so "before the handshake" by
+# created_at alone could skip a late commit. The client treats events as
+# reload signals, so a re-sent event costs one extra board reload.
+_EVENT_LATE_START_MARGIN_SECONDS = 300
 
 
 def _event_db_fingerprint(path: Path) -> Optional[tuple]:
@@ -3258,8 +3264,6 @@ async def stream_events(ws: WebSocket):
         # read yet, with the next retry time. Tailing one from the global
         # cursor instead would skip any of its events numbered below it.
         pending_start: dict[str, float] = {}
-        # created_at is whole seconds; events from the handshake second on
-        # count as new for a board that joins late (at-least-once at the edge).
         handshake_s = int(time.time())
         fingerprints: dict[str, tuple] = {}
         last_read_at: dict[str, float] = {}
@@ -3332,9 +3336,10 @@ async def stream_events(ws: WebSocket):
             """Set ``slug``'s cursor to its newest event at the handshake.
 
             Returns False when the DB cannot be read yet. A ``late`` retry
-            that succeeds after the handshake counts only events from before
-            the handshake second as seen, so events written while the board
-            was unreadable are still delivered.
+            that succeeds after the handshake starts from
+            ``_EVENT_LATE_START_MARGIN_SECONDS`` before the handshake. Events
+            written while the board was unreadable are then delivered, at the
+            cost of possibly re-sending a few the client already reflects.
             """
             path = kanban_db.kanban_db_path(board=slug)
             if not path.exists():
@@ -3348,7 +3353,7 @@ async def stream_events(ws: WebSocket):
                         row = conn.execute(
                             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
                             "WHERE created_at < ?",
-                            (handshake_s,),
+                            (handshake_s - _EVENT_LATE_START_MARGIN_SECONDS,),
                         ).fetchone()
                     else:
                         row = conn.execute(

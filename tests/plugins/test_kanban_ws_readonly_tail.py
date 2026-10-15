@@ -202,9 +202,9 @@ def test_unreadable_board_at_handshake_is_retried_not_skipped(fresh_home, monkey
     for i in range(3):
         _add_task("alpha", f"t{i}")
     _add_task("beta", "history")
-    # Make beta's history clearly older than the handshake second.
+    # Make beta's history older than the late-start margin.
     with kb.connect_closing(board="beta") as conn:
-        conn.execute("UPDATE task_events SET created_at = created_at - 10")
+        conn.execute("UPDATE task_events SET created_at = created_at - 3600")
         conn.commit()
     history = set(_all_event_ids("beta"))
     mod = _load_plugin_module()
@@ -230,6 +230,61 @@ def test_unreadable_board_at_handshake_is_retried_not_skipped(fresh_home, monkey
     assert failures["beta"] == 0
     assert beta, "beta's live event was lost while its start cursor was unreadable"
     assert not history & set(beta), "beta's history was replayed as new"
+
+
+def test_late_commit_stamped_before_the_handshake_is_not_lost(fresh_home, monkeypatch):
+    """created_at is stamped at insert, so a row committed after the handshake
+    can carry an earlier time (held transaction, skewed writer clock)."""
+    kb.create_board("beta")
+    _add_task("beta", "history")
+    with kb.connect_closing(board="beta") as conn:
+        conn.execute("UPDATE task_events SET created_at = created_at - 3600")
+        conn.commit()
+    mod = _load_plugin_module()
+    _prepare(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_EVENT_PENDING_RETRY_SECONDS", 0.0)
+    real_open = mod._open_event_db_readonly
+    failures = {"beta": 1}
+
+    def flaky_open(path):
+        if path.parent.name == "beta" and failures["beta"]:
+            failures["beta"] -= 1
+            raise mod.sqlite3.OperationalError("database is locked")
+        return real_open(path)
+
+    def late_commit():
+        _add_task("beta", "held transaction")
+        with kb.connect_closing(board="beta") as conn:
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at - 60 "
+                "WHERE id = (SELECT MAX(id) FROM task_events)")
+            conn.commit()
+
+    monkeypatch.setattr(mod, "_open_event_db_readonly", flaky_open)
+    ws = _ScriptedWebSocket({"board": "*", "since": "0"}, [late_commit, None, None])
+    asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
+
+    delivered = {e["id"] for b in ws.sent for e in b["events"] if e["board_slug"] == "beta"}
+    assert max(_all_event_ids("beta")) in delivered
+
+
+def test_unreadable_board_is_not_retried_inside_the_interval(fresh_home, monkeypatch):
+    kb.create_board("beta")
+    _add_task("beta", "x")
+    mod = _load_plugin_module()
+    _prepare(monkeypatch, mod)
+    attempts = {"beta": 0}
+
+    def always_locked(path):
+        if path.parent.name == "beta":
+            attempts["beta"] += 1
+            raise mod.sqlite3.OperationalError("database is locked")
+        raise AssertionError("unexpected board")
+
+    monkeypatch.setattr(mod, "_open_event_db_readonly", always_locked)
+    ws = _ScriptedWebSocket({"board": "*", "since": "0"}, [None] * 5)   # ~5 fast polls
+    asyncio.run(asyncio.wait_for(mod.stream_events(ws), timeout=10))
+    assert attempts["beta"] == 1     # the handshake only; next retry is 2 s out
 
 
 def test_fingerprint_needs_a_wal_and_a_forced_read_still_happens(fresh_home, monkeypatch):
